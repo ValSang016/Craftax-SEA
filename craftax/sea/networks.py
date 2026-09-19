@@ -54,13 +54,22 @@ class ObservationEncoder(nn.Module):
         if was_uint8:
             observation = observation / 255.0
         x = observation.reshape((-1,) + observation.shape[-3:])
-        x = nn.Conv(32, (5, 5), strides=(2, 2), padding="VALID")(x)
+        # Match SEA's IMPALA/Crafter image torso.  Craftax uses 63x63 RGB
+        # frames instead of Crafter's 64x64 frames, but these kernels remain
+        # valid and produce the same 4x4 final spatial extent.
+        x = nn.Conv(32, (8, 8), strides=(4, 4), padding="VALID")(x)
         x = nn.relu(x)
-        x = nn.Conv(64, (3, 3), strides=(2, 2), padding="VALID")(x)
+        x = nn.Conv(64, (4, 4), strides=(2, 2), padding="VALID")(x)
         x = nn.relu(x)
-        x = nn.Conv(64, (3, 3), strides=(2, 2), padding="VALID")(x)
+        x = nn.Conv(64, (3, 3), strides=(1, 1), padding="VALID")(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.relu(x)
         x = nn.Dense(
             self.hidden_size,
             kernel_init=orthogonal(np.sqrt(2)),
@@ -72,25 +81,22 @@ class ObservationEncoder(nn.Module):
 
 class ActorCriticRNN(nn.Module):
     action_dim: int
-    hidden_size: int = 512
+    hidden_size: int = 256
     pixel: bool = False
     num_objectives: int = 0
-    goal_embedding_size: int = 32
-    include_completed: bool = True
+    include_completed: bool = False
 
     @nn.compact
     def __call__(self, hidden, observation, reset, objective, completed):
         embedding = ObservationEncoder(self.hidden_size, self.pixel)(observation)
 
         if self.num_objectives > 0:
-            goal_embedding = nn.Embed(
-                num_embeddings=self.num_objectives,
-                features=self.goal_embedding_size,
-            )(objective.astype(jnp.int32))
-            features = [embedding, goal_embedding]
+            objective_one_hot = jax.nn.one_hot(objective, self.num_objectives)
+            features = [embedding, objective_one_hot]
             if self.include_completed:
                 features.append(completed.astype(jnp.float32))
             embedding = jnp.concatenate(features, axis=-1)
+            embedding = nn.relu(nn.Dense(self.hidden_size)(embedding))
             embedding = nn.relu(nn.Dense(self.hidden_size)(embedding))
 
         hidden, embedding = ScannedGRU(self.hidden_size)(hidden, (embedding, reset))
@@ -120,7 +126,7 @@ class TransitionEncoder(nn.Module):
 
     action_dim: int = 17
     hidden_size: int = 256
-    embedding_size: int = 128
+    embedding_size: int = 256
     pixel: bool = False
 
     @nn.compact
@@ -129,11 +135,12 @@ class TransitionEncoder(nn.Module):
         before = encoder(observation)
         after = encoder(next_observation)
         half = self.hidden_size // 2
-        # Unlike TorchBeast, the SEA vector wrapper retains the true terminal
-        # observation instead of replacing it with the next reset observation,
-        # so both sides of a terminal transition remain valid features.
+        # Original SEA masks the next-state half on episode termination.  The
+        # JAX wrapper still retains the true terminal observation for metrics
+        # and non-terminal event classification.
+        after_half = after[..., :half] * (~terminal)[..., None]
         state_features = jnp.concatenate(
-            [before[..., :half], after[..., half:]],
+            [after_half, before[..., half:]],
             axis=-1,
         )
         action_one_hot = jax.nn.one_hot(action, self.action_dim)
@@ -142,7 +149,11 @@ class TransitionEncoder(nn.Module):
         )
         x = nn.relu(nn.Dense(self.hidden_size)(x))
         x = nn.relu(nn.Dense(self.hidden_size)(x)) + state_features
-        embedding = nn.Dense(self.embedding_size)(x)
+        # SEA clusters the residual transition feature directly.  Keep an
+        # optional projection only for explicitly requested non-256 variants.
+        embedding = x if self.embedding_size == self.hidden_size else nn.Dense(
+            self.embedding_size
+        )(x)
         reward_logit = nn.Dense(1)(x)[..., 0]
         return reward_logit, embedding
 

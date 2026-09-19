@@ -10,9 +10,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training.train_state import TrainState
-from sklearn.cluster import KMeans
 
 from craftax.sea.networks import TransitionEncoder
+from craftax.sea.graph import infer_graph, transitive_reduction as _transitive_reduction
 
 
 @dataclass
@@ -24,30 +24,51 @@ class TransitionDataset:
     event_count: np.ndarray
     episode_id: np.ndarray
     episode_step: np.ndarray
+    contrast_eligible: np.ndarray
+    new_achievements: np.ndarray | None = None
 
     def __len__(self):
         return int(self.action.shape[0])
 
     def save(self, path):
-        np.savez_compressed(path, **self.__dict__)
+        np.savez_compressed(
+            path,
+            **{key: value for key, value in self.__dict__.items() if value is not None},
+        )
 
     @classmethod
     def load(cls, path):
         with np.load(path) as data:
-            return cls(**{name: data[name] for name in cls.__annotations__})
+            values = {name: data[name] for name in data.files}
+            # Datasets written by the initial port predate the 1M-step
+            # contrast window marker.  Treat them as entirely eligible.
+            values.setdefault(
+                "contrast_eligible",
+                np.ones_like(values["event_count"], dtype=bool),
+            )
+            values.setdefault("new_achievements", None)
+            return cls(**{name: values[name] for name in cls.__annotations__})
 
 
 @dataclass(frozen=True)
 class DiscoveryConfig:
-    learning_rate: float = 2e-4
-    batch_size: int = 256
-    train_steps: int = 10_000
-    hidden_size: int = 256
-    embedding_size: int = 128
+    learning_rate: float = 1e-4
+    batch_size: int = 2560
+    train_steps: int = 19_532
+    hidden_size: int = 256  # Original SEA transition-state width.
+    embedding_size: int = 256
     contrast_weight: float = 20.0
-    contrast_groups: int = 32
+    contrast_groups: int = 128
+    contrast_episode_capacity: int = 256
     max_events_per_episode: int = 8
     max_grad_norm: float = 1.0
+
+    @property
+    def mean_contrast_coefficient(self):
+        # Normalize the reference SEA objective (2560 prediction terms,
+        # 128 contrast groups, summed contrast multiplier 20). Changing the
+        # working batch/group count must not change this relative weight.
+        return self.contrast_weight * 128 / 2560
 
 
 @dataclass
@@ -102,11 +123,12 @@ def determinant_contrast_loss(embeddings, valid):
 
 
 def _contrast_indices(dataset, rng, config):
-    positive = np.flatnonzero(dataset.event_count > 0)
+    positive = np.flatnonzero((dataset.event_count > 0) & dataset.contrast_eligible)
     by_episode = {}
     for index in positive:
         by_episode.setdefault(int(dataset.episode_id[index]), []).append(index)
     usable = [np.asarray(values) for values in by_episode.values() if len(values) >= 2]
+    usable = usable[-config.contrast_episode_capacity :]
     if not usable:
         shape = (config.contrast_groups, config.max_events_per_episode)
         return np.zeros(shape, dtype=np.int64), np.zeros(shape, dtype=bool)
@@ -125,16 +147,8 @@ def _contrast_indices(dataset, rng, config):
     return indices, valid
 
 
-def train_transition_encoder(
-    dataset: TransitionDataset,
-    config: DiscoveryConfig = DiscoveryConfig(),
-    *,
-    pixel: bool = False,
-    seed: int = 0,
-):
-    if len(dataset) == 0:
-        raise ValueError("cannot train discovery model on an empty dataset")
-    rng = np.random.default_rng(seed)
+def initialize_transition_encoder(sample_dataset, config, *, pixel=False, seed=0):
+    """Build the shared encoder and optimizer update for online/offline inputs."""
     key = jax.random.PRNGKey(seed)
     network = TransitionEncoder(
         hidden_size=config.hidden_size,
@@ -144,10 +158,10 @@ def train_transition_encoder(
     sample = slice(0, 1)
     params = network.init(
         key,
-        jnp.asarray(dataset.observation[sample]),
-        jnp.asarray(dataset.action[sample]),
-        jnp.asarray(dataset.next_observation[sample]),
-        jnp.asarray(dataset.terminal[sample]),
+        jnp.asarray(sample_dataset.observation[sample]),
+        jnp.asarray(sample_dataset.action[sample]),
+        jnp.asarray(sample_dataset.next_observation[sample]),
+        jnp.asarray(sample_dataset.terminal[sample]),
     )
     tx = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
@@ -160,22 +174,58 @@ def train_transition_encoder(
         def loss_fn(parameters):
             reward_logit, _ = network.apply(parameters, *batch[:4])
             target = (batch[4] > 0).astype(jnp.float32)
-            prediction = jax.nn.sigmoid(reward_logit)
-            prediction_loss = jnp.square(prediction - target).mean()
+            prediction_valid = (
+                batch[5].astype(jnp.float32)
+                if len(batch) > 5
+                else jnp.ones_like(target)
+            )
+            # Original SEA regresses the binary reward indicator directly.
+            # We retain a mean reduction because JAX batches are configurable;
+            # it preserves the objective without making its scale batch-sized.
+            prediction_error = 0.5 * jnp.square(reward_logit - target)
+            prediction_loss = (
+                prediction_error * prediction_valid
+            ).sum() / jnp.maximum(prediction_valid.sum(), 1.0)
             _, contrast_embeddings = network.apply(parameters, *contrast_batch)
             contrast_loss = determinant_contrast_loss(contrast_embeddings, valid)
-            total = prediction_loss + config.contrast_weight * contrast_loss
+            contrast_coefficient = config.mean_contrast_coefficient
+            total = prediction_loss + contrast_coefficient * contrast_loss
             return total, (prediction_loss, contrast_loss)
 
         (loss, metrics), gradients = jax.value_and_grad(loss_fn, has_aux=True)(
             state.params
         )
-        return state.apply_gradients(grads=gradients), (loss, metrics)
+        gradient_norm = optax.global_norm(gradients)
+        return state.apply_gradients(grads=gradients), (
+            loss,
+            metrics,
+            gradient_norm,
+        )
+
+    return network, state, update
+
+
+def train_transition_encoder(
+    dataset: TransitionDataset,
+    config: DiscoveryConfig = DiscoveryConfig(),
+    *,
+    pixel: bool = False,
+    seed: int = 0,
+    contrast_dataset: TransitionDataset | None = None,
+    progress_callback=None,
+):
+    contrast_dataset = dataset if contrast_dataset is None else contrast_dataset
+    if len(dataset) == 0:
+        raise ValueError("cannot train discovery model on an empty dataset")
+    rng = np.random.default_rng(seed)
+    network, state, update = initialize_transition_encoder(
+        dataset, config, pixel=pixel, seed=seed
+    )
 
     metrics = None
-    for _ in range(config.train_steps):
+    for update_index in range(config.train_steps):
         batch_indices = rng.integers(0, len(dataset), size=config.batch_size)
-        group_indices, valid = _contrast_indices(dataset, rng, config)
+        group_indices, valid = _contrast_indices(contrast_dataset, rng, config)
         batch = (
             jnp.asarray(dataset.observation[batch_indices]),
             jnp.asarray(dataset.action[batch_indices]),
@@ -184,17 +234,25 @@ def train_transition_encoder(
             jnp.asarray(dataset.event_count[batch_indices]),
         )
         contrast_batch = (
-            jnp.asarray(dataset.observation[group_indices]),
-            jnp.asarray(dataset.action[group_indices]),
-            jnp.asarray(dataset.next_observation[group_indices]),
-            jnp.asarray(dataset.terminal[group_indices]),
+            jnp.asarray(contrast_dataset.observation[group_indices]),
+            jnp.asarray(contrast_dataset.action[group_indices]),
+            jnp.asarray(contrast_dataset.next_observation[group_indices]),
+            jnp.asarray(contrast_dataset.terminal[group_indices]),
         )
         state, metrics = update(state, batch, contrast_batch, jnp.asarray(valid))
+        if progress_callback is not None and (
+            update_index % 500 == 0 or update_index + 1 == config.train_steps
+        ):
+            progress_callback(update_index + 1, metrics)
     return network, state, metrics
 
 
-def embed_positive_transitions(network, params, dataset, batch_size=1024):
+def embed_positive_transitions(
+    network, params, dataset, batch_size=1024, max_transitions=10_000
+):
     indices = np.flatnonzero(dataset.event_count > 0)
+    if max_transitions is not None:
+        indices = indices[:max_transitions]
     chunks = []
 
     @jax.jit
@@ -222,6 +280,54 @@ def embed_positive_transitions(network, params, dataset, batch_size=1024):
     )
 
 
+def summarize_cluster_achievements(dataset, artifacts):
+    """Describe the positive prefix used by embed_positive_transitions.
+
+    Percentages use cluster transition counts, so simultaneous unlocks can
+    make their sum exceed 100. Ground-truth names are diagnostics only.
+    """
+    from craftax.sea.metrics import ACHIEVEMENT_NAMES
+
+    if dataset.new_achievements is None:
+        return {
+            "available": False,
+            "reason": "dataset has no new_achievements metadata",
+        }
+    indices = np.flatnonzero(dataset.event_count > 0)[: len(artifacts.labels)]
+    if len(indices) != len(artifacts.labels):
+        raise ValueError("cluster labels exceed positive transition count")
+    achievements = np.asarray(dataset.new_achievements, dtype=bool)
+    if achievements.shape != (len(dataset), len(ACHIEVEMENT_NAMES)):
+        raise ValueError("new_achievements must have shape (transitions, 22)")
+    selected = achievements[indices]
+    clusters = []
+    for cluster_id in range(len(artifacts.centroids)):
+        rows = selected[artifacts.labels == cluster_id]
+        count = len(rows)
+        counts = rows.sum(axis=0)
+        clusters.append(
+            {
+                "cluster_id": cluster_id,
+                "transition_count": count,
+                "unlabeled_transition_count": int((~rows.any(axis=1)).sum()),
+                "multi_achievement_transition_count": int((rows.sum(axis=1) > 1).sum()),
+                "achievements": {
+                    name: {
+                        "count": int(value),
+                        "percent": 100.0 * int(value) / count if count else 0.0,
+                    }
+                    for name, value in zip(ACHIEVEMENT_NAMES, counts)
+                },
+            }
+        )
+    return {
+        "available": True,
+        "transition_count": len(indices),
+        "percent_denominator": "transitions in each cluster; simultaneous unlocks may sum above 100%",
+        "clusters": clusters,
+    }
+
+
 def _count_conflicts(labels, episode_id):
     conflicts = 0
     for episode in np.unique(episode_id):
@@ -229,27 +335,6 @@ def _count_conflicts(labels, episode_id):
         _, counts = np.unique(values, return_counts=True)
         conflicts += int(((counts * (counts - 1)) // 2).sum())
     return conflicts
-
-
-def _transitive_reduction(graph):
-    graph = graph.astype(bool).copy()
-    count = graph.shape[0]
-    for source in range(count):
-        for target in range(count):
-            if not graph[source, target]:
-                continue
-            graph[source, target] = False
-            reachable = np.zeros(count, dtype=bool)
-            frontier = [source]
-            while frontier:
-                node = frontier.pop()
-                for child in np.flatnonzero(graph[node]):
-                    if not reachable[child]:
-                        reachable[child] = True
-                        frontier.append(int(child))
-            if not reachable[target]:
-                graph[source, target] = True
-    return graph.astype(np.int8)
 
 
 def fit_clusters(
@@ -263,6 +348,8 @@ def fit_clusters(
     random_state=0,
 ):
     """Fit SEA's constrained KMeans and recover its temporal graph."""
+
+    from sklearn.cluster import KMeans
 
     embeddings = np.asarray(embeddings, dtype=np.float32)
     episode_id = np.asarray(episode_id)
@@ -303,27 +390,7 @@ def fit_clusters(
     out_edge = min(out_thresholds, default=in_edge * 1.1 + 1e-6)
     threshold = float(max(1e-8, (in_edge + out_edge) / 2.0))
 
-    order = np.zeros((len(centroids), len(centroids)), dtype=np.int64)
-    happens = np.zeros((len(centroids),), dtype=np.int64)
-    for episode in np.unique(episode_id):
-        indexes = np.flatnonzero(episode_id == episode)
-        indexes = indexes[np.argsort(episode_step[indexes])]
-        sequence = labels[indexes]
-        for position, source in enumerate(sequence):
-            happens[source] += 1
-            for target in sequence[position + 1 :]:
-                order[source, target] += 1
-
-    graph = np.zeros_like(order, dtype=np.int8)
-    for source in range(len(centroids)):
-        for target in range(len(centroids)):
-            forward = order[source, target]
-            if forward == 0:
-                continue
-            usually_before = forward / max(1, happens[target]) > 0.97
-            almost_never_reverse = order[target, source] / forward < 0.001
-            graph[source, target] = usually_before & almost_never_reverse
-    graph = _transitive_reduction(graph)
+    graph = infer_graph(labels, episode_id, episode_step, len(centroids)).graph
     return ClusterArtifacts(centroids, threshold, graph, labels.astype(np.int32))
 
 
@@ -334,5 +401,7 @@ __all__ = [
     "determinant_contrast_loss",
     "embed_positive_transitions",
     "fit_clusters",
+    "initialize_transition_encoder",
+    "summarize_cluster_achievements",
     "train_transition_encoder",
 ]

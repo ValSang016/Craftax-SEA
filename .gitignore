@@ -3,6 +3,19 @@ wandb/
 res/
 runs/
 
+# Local SEA ablations and one-off experiment analysis.  Keep the canonical
+# training launcher tracked while retaining these files locally for reference.
+craftax/sea/goal_from_encoder_and_dataset.py
+craftax/sea/networks_ff.py
+craftax/sea/oracle_train.py
+craftax/sea/ppo_ff.py
+craftax/sea/recluster_train.py
+scripts/*.py
+!scripts/run_sea_experiments.py
+tests/sea/test_oracle_goal.py
+tests/sea/test_ppo_ff.py
+docs/sea/experiments.json
+
 play_data
 
 # Byte-compiled / optimized / DLL files

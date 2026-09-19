@@ -14,6 +14,7 @@ from craftax.sea.goal import (
     apply_goal_transition,
     initialize_goal_state,
 )
+from craftax.sea.metrics import rollout_episode_metrics
 from craftax.sea.networks import ActorCriticRNN, ScannedGRU
 from craftax.sea.vector_env import SeaAutoResetVecEnv
 
@@ -29,10 +30,10 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.8
     clip_epsilon: float = 0.2
-    entropy_coefficient: float = 0.01
+    entropy_coefficient: float = 0.001
     value_coefficient: float = 0.5
     max_grad_norm: float = 1.0
-    hidden_size: int = 512
+    hidden_size: int = 256
     reset_ratio: int = 16
     anneal_learning_rate: bool = True
 
@@ -58,6 +59,8 @@ class Transition(NamedTuple):
     next_observation: jax.Array
     objective: jax.Array
     completed: jax.Array
+    achievements: jax.Array
+    episode_length: jax.Array
 
 
 def categorical_log_prob(logits, action):
@@ -90,7 +93,10 @@ def calculate_gae(transitions, last_value, config: PPOConfig):
     return advantages, advantages + transitions.value
 
 
-def make_train(config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None):
+def make_train(
+    config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None,
+    progress_callback=None, progress_interval: int = 50,
+):
     """Build a jittable base-policy PPO training function.
 
     Goal-conditioned reward and pseudo-terminal handling are layered on this
@@ -98,6 +104,8 @@ def make_train(config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None
     """
 
     config.validate()
+    if progress_interval < 1:
+        raise ValueError("progress_interval must be positive")
     vec_env = SeaAutoResetVecEnv(env, config.num_envs, config.reset_ratio)
     params = env.default_params
     num_updates = config.total_timesteps // (config.num_envs * config.num_steps)
@@ -216,6 +224,7 @@ def make_train(config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None
                         info["terminal_obs"],
                         env_done,
                         reward,
+                        new_achievements=info["new_achievements"],
                     )
                 bootstrap_done = env_done | goal_done
                 next_reset = (
@@ -235,6 +244,8 @@ def make_train(config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None
                     info["terminal_obs"],
                     objective,
                     completed,
+                    info["achievements"],
+                    info["episode_length"],
                 )
                 return (
                     train_state,
@@ -347,8 +358,9 @@ def make_train(config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None
                     (loss, metrics), gradients = jax.value_and_grad(
                         loss_fn, has_aux=True
                     )(train_state.params)
+                    gradient_norm = optax.global_norm(gradients)
                     train_state = train_state.apply_gradients(grads=gradients)
-                    return train_state, (loss, metrics)
+                    return train_state, (loss, metrics, gradient_norm)
 
                 train_state, losses = jax.lax.scan(
                     minibatch,
@@ -384,7 +396,32 @@ def make_train(config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None
                     transitions.bootstrap_done & ~transitions.env_done
                 ).mean(),
                 "loss": losses[0].mean(),
+                "actor_loss": losses[1][0].mean(),
+                "value_loss": losses[1][1].mean(),
+                "entropy": losses[1][2].mean(),
+                "gradient_norm": losses[2].mean(),
+                "gradient_clip_fraction": (
+                    losses[2] > config.max_grad_norm
+                ).mean(),
             }
+            metrics.update(rollout_episode_metrics(transitions))
+            if progress_callback is not None:
+                update_count = train_state.step // (
+                    config.update_epochs * config.num_minibatches
+                )
+
+                def report(_):
+                    jax.debug.callback(
+                        progress_callback, update_count, metrics, train_state.params,
+                        ordered=True,
+                    )
+
+                jax.lax.cond(
+                    (update_count == 1)
+                    | (update_count % progress_interval == 0)
+                    | (update_count == num_updates),
+                    report, lambda _: None, operand=None,
+                )
             return runner_state, metrics
 
         runner_state, metrics = jax.lax.scan(

@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from craftax.craftax_classic.constants import DIRECTIONS, Action
+from craftax.craftax_classic.constants import DIRECTIONS, Achievement, Action
 from craftax.craftax_classic.envs.common import compute_score
 from craftax.craftax_classic.envs.craftax_pixels_env import (
     CraftaxClassicPixelsEnvNoAutoReset,
@@ -79,6 +79,34 @@ def _restore_nonlethal_mob_damage(
     )
 
 
+def _restore_immortal_player(old_state: EnvState, new_state: EnvState) -> EnvState:
+    """Apply the modified Crafter immortal-health setter semantics.
+
+    In the SEA fork a damage assignment leaves health at nine.  Consequently
+    ``_wake_up_when_hurt`` also sees no health decrease.  Craftax damage code
+    wakes the player directly, so that side effect must be undone as well.
+    """
+
+    hurt_wake = (
+        old_state.is_sleeping
+        & (old_state.player_energy < 9)
+        & ~new_state.is_sleeping
+    )
+    wake_index = Achievement.WAKE_UP.value
+    achievements = new_state.achievements.at[wake_index].set(
+        jnp.where(
+            hurt_wake,
+            old_state.achievements[wake_index],
+            new_state.achievements[wake_index],
+        )
+    )
+    return new_state.replace(
+        player_health=jnp.int32(9),
+        is_sleeping=jnp.where(hurt_wake, True, new_state.is_sleeping),
+        achievements=achievements,
+    )
+
+
 class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
     """Pixel or symbolic Craftax-Classic with SEA-compatible mechanics."""
 
@@ -120,7 +148,7 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         # The original immortal setter immediately writes health=9.  Restore it
         # before rendering so neither symbolic nor pixel observations expose a
         # transient death state.
-        stepped_state = stepped_state.replace(player_health=jnp.int32(9))
+        stepped_state = _restore_immortal_player(old_state, stepped_state)
 
         new_achievements = stepped_state.achievements & ~old_state.achievements
         event_count = new_achievements.astype(jnp.float32).sum()
@@ -139,6 +167,11 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
                 "event_count": event_count,
                 "event_happened": event_happened,
                 "new_achievements": new_achievements,
+                # The vector wrapper resets immediately after this call.  Keep
+                # terminal episode state in info so PPO can aggregate the same
+                # per-episode metrics as SEA's CrafterMonitorWrapper.
+                "achievements": stepped_state.achievements,
+                "episode_length": stepped_state.timestep,
                 "idle_steps": idle_steps,
                 "idle_done": idle_done,
                 "time_done": time_done,
@@ -194,5 +227,6 @@ def make_sea_craftax_classic_env(
 __all__ = [
     "SeaCraftaxClassicEnvNoAutoReset",
     "SeaEnvState",
+    "_restore_immortal_player",
     "make_sea_craftax_classic_env",
 ]

@@ -28,6 +28,7 @@ class GoalRuntime:
     exploration_reward_coefficient: float = 0.1
     include_new_tasks: bool = True
     reset_rnn_on_goal: bool = True
+    oracle_achievement_ids: tuple[int, ...] | None = None
 
     @property
     def num_clusters(self):
@@ -107,30 +108,47 @@ def apply_goal_transition(
     next_observation,
     env_done,
     event_count,
+    new_achievements=None,
 ):
     """Classify an event, shape reward and update the meta-controller."""
 
-    _, embeddings = runtime.transition_network.apply(
-        runtime.transition_params,
-        observation,
-        action,
-        next_observation,
-        env_done,
-    )
-    predicted_class, distance = classify_embeddings(
-        embeddings, runtime.centroids, runtime.threshold
-    )
-    event_happened = event_count > 0
-    predicted_class = jnp.where(event_happened, predicted_class, runtime.num_clusters)
-    goal_done = event_happened & (predicted_class == goal_state.objective)
-    shaped_reward = goal_done.astype(jnp.float32) + (
-        runtime.exploration_reward_coefficient * event_count
-    )
+    if runtime.oracle_achievement_ids is not None:
+        if new_achievements is None:
+            raise ValueError("Oracle runtime requires new_achievements")
+        known = new_achievements[:, jnp.asarray(runtime.oracle_achievement_ids)]
+        unknown = new_achievements.sum(-1) > known.sum(-1)
+        events = jnp.concatenate([known, unknown[:, None]], axis=-1)
+        event_happened = new_achievements.any(-1)
+        goal_done = jnp.take_along_axis(events, goal_state.objective[:, None], axis=1)[:, 0]
+        # For simultaneous events, prefer the achieved objective as last event;
+        # otherwise use the first known event, or unknown if no known event.
+        predicted_class = jnp.where(known.any(-1), jnp.argmax(known, axis=-1), runtime.num_clusters)
+        predicted_class = jnp.where(goal_done, goal_state.objective, predicted_class)
+        distance = jnp.zeros_like(event_count, dtype=jnp.float32)
+        completed_event = events.at[:, runtime.num_clusters].set(False)
+        shaped_reward = goal_done.astype(jnp.float32) + runtime.exploration_reward_coefficient * event_count
+    else:
+        _, embeddings = runtime.transition_network.apply(
+            runtime.transition_params,
+            observation,
+            action,
+            next_observation,
+            env_done,
+        )
+        predicted_class, distance = classify_embeddings(
+            embeddings, runtime.centroids, runtime.threshold
+        )
+        event_happened = event_count > 0
+        predicted_class = jnp.where(event_happened, predicted_class, runtime.num_clusters)
+        goal_done = event_happened & (predicted_class == goal_state.objective)
+        shaped_reward = goal_done.astype(jnp.float32) + (
+            runtime.exploration_reward_coefficient * event_count
+        )
 
-    completed_event = (
-        jax.nn.one_hot(predicted_class, runtime.num_objectives, dtype=jnp.bool_)
-        & event_happened[:, None]
-    )
+        completed_event = (
+            jax.nn.one_hot(predicted_class, runtime.num_objectives, dtype=jnp.bool_)
+            & event_happened[:, None]
+        )
     completed = goal_state.completed | completed_event
     last_completed = jnp.where(
         event_happened, predicted_class, goal_state.last_completed

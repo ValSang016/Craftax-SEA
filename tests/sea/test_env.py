@@ -1,8 +1,9 @@
 import jax
 import jax.numpy as jnp
 
-from craftax.craftax_classic.constants import DIRECTIONS, Action
+from craftax.craftax_classic.constants import DIRECTIONS, Achievement, Action
 from craftax.sea.env import (
+    _restore_immortal_player,
     _restore_nonlethal_mob_damage,
     make_sea_craftax_classic_env,
 )
@@ -55,17 +56,35 @@ def test_equal_attack_damage_is_lethal():
     assert not corrected.cows.mask[0]
 
 
+def test_immortality_does_not_create_hurt_wake_up_event():
+    env = make_sea_craftax_classic_env()
+    _, state = env.reset(jax.random.PRNGKey(11))
+    old = state.env_state.replace(is_sleeping=jnp.array(True), player_energy=1)
+    wake_index = Achievement.WAKE_UP.value
+    attacked = old.replace(
+        player_health=2,
+        is_sleeping=jnp.array(False),
+        achievements=old.achievements.at[wake_index].set(True),
+    )
+    corrected = _restore_immortal_player(old, attacked)
+    assert corrected.player_health == 9
+    assert corrected.is_sleeping
+    assert not corrected.achievements[wake_index]
+
+
 def test_reset_and_step_keep_player_immortal():
     env = make_sea_craftax_classic_env()
     params = env.default_params
     _, state = env.reset(jax.random.PRNGKey(2), params)
     state = state.replace(env_state=state.env_state.replace(player_health=0))
-    _, next_state, reward, done, _ = env.step(
+    _, next_state, reward, done, info = env.step(
         jax.random.PRNGKey(3), state, Action.NOOP.value, params
     )
     assert next_state.env_state.player_health == 9
     assert reward == 0
     assert not done
+    assert info["achievements"].shape == (22,)
+    assert info["episode_length"] == next_state.env_state.timestep
 
 
 def test_idle_timeout_is_exactly_one_hundred_steps():
