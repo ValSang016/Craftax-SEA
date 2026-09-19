@@ -1,9 +1,10 @@
 # SEA on Craftax-Classic with PPO-RNN
 
 **기본 버전: SEA (fix123).** [코드·실험 안내](docs/sea/README.md) ·
-[원본과의 차이](docs/sea/alignment.md)
+[원본과의 차이](docs/sea/alignment.md) · [전체 결과](runs/sea-overview/index.html)
 
 fix123는 현재 기준 포팅이며, 원본 ICLR-SEA와 수치적으로 동일한 reproduction은 아닙니다.
+Oracle/GT, FF, 고정 K 실험은 별도 변형으로 구분합니다.
 
 This implementation keeps the original Craftax-Classic environments intact and
 adds SEA-specific modules under `craftax/sea`.
@@ -17,6 +18,8 @@ adds SEA-specific modules under `craftax/sea`.
 - reward is newly unlocked achievement count, with no health shaping;
 - creature damage is lethal-only and cannot accumulate; and
 - cow, skeleton and zombie health are 2, 3 and 5.
+
+
 
 ## Quick smoke run
 
@@ -87,12 +90,12 @@ but the primary CLI does not use them.
 - policy, recurrent, transition, and clustering embedding widths default to 256;
 - the pixel torso uses SEA's 8/4, 4/2, 3/1 convolutions and two 256-wide layers;
 - objectives are one-hot encoded by two 256-wide layers, without the legacy
-  completed-objective vector;
+completed-objective vector;
 - representation learning uses Adam at 1e-4, 128 contrast episode groups, at
-  most 8 events per episode, a 256-episode contrast buffer, and contrast weight
-  20;
+most 8 events per episode, a 256-episode contrast buffer, and contrast weight
+20;
 - collection policy, discovery, and goal-policy budgets are 200M, 50M, and
-  300M environment interactions respectively.
+300M environment interactions respectively.
 
 The policy learner intentionally remains Craftax's JAX PPO-RNN design: 1024
 parallel environments x 64 rollout steps, GAE, clipped PPO, Adam, GRU, four
@@ -183,3 +186,26 @@ python scripts/run_sea_experiments.py --output runs/streaming-sea \
 
 This trains a fresh encoder and exploration policy using the saved collection
 PPO. It retains separate configs, source snapshots, checkpoints and metrics.
+
+## Feed-forward PPO comparison
+
+`--policy ff` selects a stateless actor-critic with the same observation encoder
+and actor/value heads, omitting the GRU. PPO minibatches shuffle individual
+transitions across both time and environment axes. No frame stacking or previous
+observation/action is added; goal policies still receive the current objective.
+The parameter count is consequently lower than PPO-RNN. Existing recurrent
+training remains the default (`--policy rnn`).
+
+`--base-only` stops after collection-policy training and saves base metrics and
+checkpoints. For a full SEA-PPO run omit this flag: the fresh collection policy,
+streaming discovery rollouts and goal policy all use feed-forward PPO. Encoder
+learning and graph generation retain fix123 semantics (automatic K up to 30,
+including transitive reduction). The budgets remain 200M / 50M / 300M.
+
+```bash
+python scripts/run_sea_experiments.py --output runs/ppo-ff-base \
+  --gpus 0 --seeds 0 --policy ff --base-only
+python scripts/run_sea_experiments.py --output runs/sea-ppo-ff-full \
+  --gpus 1 --seeds 0 --policy ff
+```
+
