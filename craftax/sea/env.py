@@ -6,7 +6,7 @@ This module reproduces the non-vanilla Crafter settings from the SEA codebase:
 * lava and health do not terminate the episode;
 * an episode ends after 100 steps without a newly unlocked achievement;
 * reward is the number of newly unlocked achievements (no health shaping);
-* creatures only take damage when the current hit is lethal; and
+* creature damage is configurable (SEA lethal-only by default, or cumulative); and
 * cow, skeleton and zombie health are 2, 3 and 5 respectively.
 
 The environment never auto-resets.  This is important for SEA because the
@@ -114,11 +114,21 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         self,
         symbolic: bool = True,
         idle_timeout: int = 100,
+        immortal: bool = True,
+        health_reward_coef: float = 0.0,
+        combat_damage_mode: str = "lethal-only",
         static_env_params=None,
     ):
         super().__init__()
         self.symbolic = symbolic
         self.idle_timeout = int(idle_timeout)
+        self.immortal = bool(immortal)
+        self.health_reward_coef = float(health_reward_coef)
+        if combat_damage_mode not in {"lethal-only", "cumulative"}:
+            raise ValueError(
+                "combat_damage_mode must be 'lethal-only' or 'cumulative'"
+            )
+        self.combat_damage_mode = combat_damage_mode
         base_cls = (
             CraftaxClassicSymbolicEnvNoAutoReset
             if symbolic
@@ -144,12 +154,19 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
             key, old_state, action, params, self.static_env_params
         )
 
-        stepped_state = _restore_nonlethal_mob_damage(old_state, stepped_state, action)
+        if self.combat_damage_mode == "lethal-only":
+            stepped_state = _restore_nonlethal_mob_damage(
+                old_state, stepped_state, action
+            )
         # The original immortal setter immediately writes health=9.  Restore it
         # before rendering so neither symbolic nor pixel observations expose a
         # transient death state.
-        stepped_state = _restore_immortal_player(old_state, stepped_state)
+        if self.immortal:
+            stepped_state = _restore_immortal_player(old_state, stepped_state)
 
+        health_delta = (
+            stepped_state.player_health - old_state.player_health
+        ).astype(jnp.float32)
         new_achievements = stepped_state.achievements & ~old_state.achievements
         event_count = new_achievements.astype(jnp.float32).sum()
         event_happened = new_achievements.any()
@@ -157,7 +174,13 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
 
         idle_done = idle_steps >= self.idle_timeout
         time_done = stepped_state.timestep >= params.max_timesteps
-        done = idle_done | time_done
+        health_done = (
+            stepped_state.player_health <= 0
+            if not self.immortal
+            else jnp.asarray(False)
+        ) # 체력 소진으로 끝났는지 확인하기 위한 variable
+        done = idle_done | time_done | health_done
+        reward = event_count + self.health_reward_coef * health_delta
         new_state = SeaEnvState(stepped_state, idle_steps)
 
         info = compute_score(stepped_state, done)
@@ -175,13 +198,14 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
                 "idle_steps": idle_steps,
                 "idle_done": idle_done,
                 "time_done": time_done,
+                "health_done": health_done,
             }
         )
 
         return (
             lax.stop_gradient(self.get_obs(new_state)),
             lax.stop_gradient(new_state),
-            event_count,
+            reward,
             done,
             info,
         )
@@ -198,8 +222,14 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         return self._base_env.get_obs(state.env_state)
 
     def is_terminal(self, state: SeaEnvState, params: EnvParams) -> bool:
-        return (state.idle_steps >= self.idle_timeout) | (
-            state.env_state.timestep >= params.max_timesteps
+        return (
+            (state.idle_steps >= self.idle_timeout)
+            | (state.env_state.timestep >= params.max_timesteps)
+            | (
+                (state.env_state.player_health <= 0)
+                if not self.immortal
+                else jnp.asarray(False)
+            )
         )
 
     @property
@@ -219,9 +249,19 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
 
 
 def make_sea_craftax_classic_env(
-    symbolic: bool = True, idle_timeout: int = 100
+    symbolic: bool = True,
+    idle_timeout: int = 100,
+    immortal: bool = True,
+    health_reward_coef: float = 0.0,
+    combat_damage_mode: str = "lethal-only",
 ) -> SeaCraftaxClassicEnvNoAutoReset:
-    return SeaCraftaxClassicEnvNoAutoReset(symbolic=symbolic, idle_timeout=idle_timeout)
+    return SeaCraftaxClassicEnvNoAutoReset(
+        symbolic=symbolic,
+        idle_timeout=idle_timeout,
+        immortal=immortal,
+        health_reward_coef=health_reward_coef,
+        combat_damage_mode=combat_damage_mode,
+    )
 
 
 __all__ = [

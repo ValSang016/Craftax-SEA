@@ -344,7 +344,7 @@ def fit_clusters(
     *,
     min_clusters=None,
     max_clusters=30,
-    conflict_fraction=0.001,
+    conflict_fraction=0.01, #0.001,
     random_state=0,
 ):
     """Fit SEA's constrained KMeans and recover its temporal graph."""

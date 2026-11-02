@@ -25,6 +25,13 @@ def test_default_params_match_sea_creature_health():
     assert params.zombie_health == 5
 
 
+def test_cow_health_stays_at_sea_value_in_cumulative_mode():
+    params = make_sea_craftax_classic_env(
+        combat_damage_mode="cumulative"
+    ).default_params
+    assert params.cow_health == 2
+
+
 def test_nonlethal_damage_is_not_accumulated():
     env = make_sea_craftax_classic_env()
     _, state = env.reset(jax.random.PRNGKey(0))
@@ -54,6 +61,39 @@ def test_equal_attack_damage_is_lethal():
     corrected = _restore_nonlethal_mob_damage(old, killed, Action.DO.value)
     assert corrected.cows.health[0] == 0
     assert not corrected.cows.mask[0]
+
+
+def test_combat_damage_mode_controls_nonlethal_accumulation(monkeypatch):
+    from craftax.sea import env as sea_env
+
+    def chip_damage(key, old, action, params, static_params):
+        cows = old.cows.replace(health=old.cows.health.at[0].set(1))
+        return old.replace(cows=cows, timestep=old.timestep + 1), 0.0
+
+    monkeypatch.setattr(sea_env, "craftax_step", chip_damage)
+    key = jax.random.PRNGKey(15)
+
+    lethal_only = make_sea_craftax_classic_env(
+        combat_damage_mode="lethal-only"
+    )
+    params = lethal_only.default_params
+    _, state = lethal_only.reset(key, params)
+    core = state.env_state
+    state = state.replace(
+        env_state=core.replace(cows=_put_in_front(core, core.cows, hp=2))
+    )
+    _, restored, _, _, _ = lethal_only.step_env(
+        key, state, Action.DO.value, params
+    )
+    assert restored.env_state.cows.health[0] == 2
+
+    cumulative = make_sea_craftax_classic_env(
+        combat_damage_mode="cumulative"
+    )
+    _, accumulated, _, _, _ = cumulative.step_env(
+        key, state, Action.DO.value, params
+    )
+    assert accumulated.env_state.cows.health[0] == 1
 
 
 def test_immortality_does_not_create_hurt_wake_up_event():
@@ -98,3 +138,80 @@ def test_idle_timeout_is_exactly_one_hundred_steps():
     assert next_state.idle_steps == 100
     assert done
     assert info["idle_done"]
+
+
+def test_mortal_health_reward_and_terminal_are_configurable(monkeypatch):
+    from craftax.sea import env as sea_env
+
+    env = make_sea_craftax_classic_env(
+        immortal=False, health_reward_coef=0.5
+    )
+    params = env.default_params
+    _, state = env.reset(jax.random.PRNGKey(12), params)
+
+    def lose_health(key, old, action, params, static_params):
+        health = jnp.where(action == Action.NOOP.value, 7, 0)
+        return old.replace(player_health=health, timestep=old.timestep + 1), 0.0
+
+    monkeypatch.setattr(sea_env, "craftax_step", lose_health)
+    _, next_state, reward, done, info = env.step(
+        jax.random.PRNGKey(13), state, Action.NOOP.value, params
+    )
+    assert next_state.env_state.player_health == 7
+    assert reward == -1.0
+    assert not done
+    assert not info["health_done"]
+
+    _, _, reward, done, info = env.step(
+        jax.random.PRNGKey(14), state, Action.DO.value, params
+    )
+    assert reward == -4.5
+    assert done
+    assert info["health_done"]
+
+
+def test_immortal_environment_omits_health_shaping(monkeypatch):
+    from craftax.sea import env as sea_env
+
+    env = make_sea_craftax_classic_env(
+        immortal=True, health_reward_coef=0.5
+    )
+    params = env.default_params
+    _, state = env.reset(jax.random.PRNGKey(16), params)
+
+    def lose_health(key, old, action, params, static_params):
+        return old.replace(player_health=7, timestep=old.timestep + 1), 0.0
+
+    monkeypatch.setattr(sea_env, "craftax_step", lose_health)
+    _, next_state, reward, done, _ = env.step(
+        jax.random.PRNGKey(17), state, Action.NOOP.value, params
+    )
+    assert next_state.env_state.player_health == 9
+    assert reward == 0.0
+    assert not done
+
+
+def test_cli_exposes_immortal_and_health_reward_settings():
+    from craftax.sea.train import build_parser
+
+    args = build_parser().parse_args([
+        "--immortal", "false", "--health-reward-coef", "0.1"
+    ])
+    assert args.immortal is False
+    assert args.health_reward_coef == 0.1
+    assert args.combat_damage_mode == "lethal-only"
+    assert args.goal_success_coefficient == 5.0
+    assert args.non_target_achievement_coefficient == 1.0
+
+    from craftax.sea.train_goal_only import build_parser as build_goal_only_parser
+
+    goal_only = build_goal_only_parser().parse_args([
+        "source", "--output", "output"
+    ])
+    assert goal_only.goal_success_coefficient == 5.0
+    assert goal_only.non_target_achievement_coefficient == 1.0
+
+    cumulative = build_parser().parse_args([
+        "--combat-damage-mode", "cumulative"
+    ])
+    assert cumulative.combat_damage_mode == "cumulative"

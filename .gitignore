@@ -11,6 +11,9 @@ craftax/sea/oracle_train.py
 craftax/sea/ppo_ff.py
 craftax/sea/recluster_train.py
 scripts/*.py
+!scripts/summarize_sea_metrics.py
+!scripts/visualize_sea_graph.py
+!scripts/replay_sea_policy.py
 !scripts/run_sea_experiments.py
 tests/sea/test_oracle_goal.py
 tests/sea/test_ppo_ff.py
@@ -101,6 +104,12 @@ target/
 # IPython
 profile_default/
 ipython_config.py
+
+# logs
+logs/
+videos/
+wandb/
+runs/
 
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is

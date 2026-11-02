@@ -123,6 +123,24 @@ gradient norm, and the fraction of minibatches whose norm exceeded the clip.
 The corresponding `*_metrics_history.npz` files retain every PPO update rather
 than only the final/cumulative JSON summary.
 
+For the final-window training-rollout report used in the reproduction tables,
+aggregate the last 50 PPO updates with:
+
+```bash
+python scripts/summarize_sea_metrics.py runs/ppo-rnn-200m --stage base \
+  --window 50 --output runs/ppo-rnn-200m/final-window.json
+
+python scripts/summarize_sea_metrics.py runs/sea-experiment --stage goal \
+  --window 50 --output runs/sea-experiment/final-window.json
+```
+
+The script reports Easy17, Hard4, and Crafter Score21 (all exclude
+`eat_plant` where applicable), plus Diamond and Iron Pickaxe success rates. A
+run root may contain multiple `seed-*` directories; they are summarized
+individually and then with an equal-seed mean and sample standard deviation.
+This is explicitly a final-window **training-rollout** report, not held-out
+checkpoint evaluation.
+
 Clustering also writes `cluster_achievements.json`: each cluster reports its
 transition count and all 22 ground-truth achievement counts/percentages. The
 denominator is the number of transitions in that cluster; simultaneous unlocks

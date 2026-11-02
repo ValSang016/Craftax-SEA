@@ -14,6 +14,7 @@ from flax import serialization
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tqdm.auto import tqdm
 
 from craftax.sea.checkpoint import save_params
 from craftax.sea.discovery import (
@@ -23,11 +24,89 @@ from craftax.sea.discovery import (
     summarize_cluster_achievements,
 )
 from craftax.sea.env import make_sea_craftax_classic_env
-from craftax.sea.goal import GoalRuntime
-from craftax.sea.metrics import summarize_training_metrics
+from craftax.sea.goal import GoalRuntime, load_oracle_graph
+from craftax.sea.metrics import (
+    EASY17_ACHIEVEMENT_INDICES,
+    NO_EAT_PLANT_ACHIEVEMENT_INDICES,
+    summarize_training_metrics,
+)
 from craftax.sea.ppo_rnn import PPOConfig, make_train
 from craftax.sea.rollout import iter_policy_transitions
 from craftax.sea.streaming_discovery import collect_clustering_dataset, train_streaming_encoder
+
+
+def _parse_bool(value):
+    normalized = value.lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
+class _WandbLogger:
+    """Optional host-side W&B logging for JAX debug callbacks."""
+
+    def __init__(self, args, config):
+        self.run = None
+        if args.wandb_project is None:
+            return
+        try:
+            import wandb
+        except ImportError as error:
+            raise ImportError(
+                "W&B logging requires the 'wandb' package; install it with "
+                "`pip install wandb` or install the sea extra"
+            ) from error
+
+        self.run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.wandb_name, group=args.wandb_group, mode=args.wandb_mode,
+            tags=args.wandb_tags, config=config, dir=str(Path(args.output).resolve()),
+        )
+        for stage in ("base", "goal"):
+            self.run.define_metric(f"{stage}/steps")
+            self.run.define_metric(f"{stage}/*", step_metric=f"{stage}/steps")
+        self.run.define_metric("encoder/interactions")
+        self.run.define_metric("encoder/*", step_metric="encoder/interactions")
+
+    @staticmethod
+    def _scalars(metrics):
+        values = {}
+        for name, value in metrics.items():
+            array = np.asarray(value)
+            if array.ndim == 0:
+                values[name] = float(array)
+        return values
+
+    def log_policy(self, stage, steps, metrics, steps_per_second=None):
+        if self.run is None:
+            return
+        values = {f"{stage}/steps": steps, **{
+            f"{stage}/{name}": value
+            for name, value in self._scalars(metrics).items()
+        }}
+        if steps_per_second is not None:
+            values[f"{stage}/steps_per_second"] = steps_per_second
+        self.run.log(values)
+
+    def log_encoder(self, update, metrics, counters):
+        if self.run is None:
+            return
+        self.run.log({
+            "encoder/interactions": counters["prediction_transitions_seen"],
+            "encoder/update": update,
+            "encoder/total_loss": float(metrics[0]),
+            "encoder/prediction_loss": float(metrics[1][0]),
+            "encoder/contrast_loss": float(metrics[1][1]),
+            "encoder/gradient_norm": float(metrics[2]),
+            "encoder/positive_fraction": counters["prediction_positive_fraction"],
+            "encoder/contrast_episodes": counters["contrast_episodes"],
+        })
+
+    def finish(self):
+        if self.run is not None:
+            self.run.finish()
 
 
 def _save_metric_summary(path, metrics):
@@ -40,12 +119,20 @@ def _save_metric_summary(path, metrics):
     return summary
 
 
-def _progress_reporter(output, stage, config):
+def _progress_reporter(output, stage, config, wandb_logger=None):
     started = time.perf_counter()
     previous = [None, None]
+    total_updates = config.total_timesteps // (config.num_envs * config.num_steps)
+    progress = tqdm(
+        total=total_updates,
+        desc=f"[{stage}] PPO",
+        unit="update",
+        dynamic_ncols=True,
+    )
 
     def report(update, metrics, params):
         update = int(update)
+        progress.update(max(0, update - progress.n))
         steps = update * config.num_envs * config.num_steps
         now = time.perf_counter()
         record = {
@@ -70,13 +157,21 @@ def _progress_reporter(output, stage, config):
         status = output / "progress.tmp"
         status.write_text(json.dumps(record, indent=2), encoding="utf-8")
         status.replace(output / "progress.json")
-        print(
+        if wandb_logger is not None:
+            wandb_logger.log_policy(stage, steps, metrics, record.get("steps_per_second"))
+        progress.set_postfix(
+            loss=f"{float(metrics['loss']):.4f}",
+            return_=f"{float(metrics['mean_episode_return']):.2f}",
+            sps=f"{record.get('steps_per_second', 0):.0f}",
+        )
+        tqdm.write(
             f"[{stage}] update={update}/{record['total_updates']} steps={steps} "
             f"loss={float(metrics['loss']):.6f} "
             f"return={float(metrics['mean_episode_return']):.3f} "
-            f"sps={record.get('steps_per_second', 0):.1f}",
-            flush=True,
+            f"sps={record.get('steps_per_second', 0):.1f}"
         )
+        if update >= total_updates:
+            progress.close()
 
     return report
 
@@ -84,6 +179,19 @@ def _progress_reporter(output, stage, config):
 def run_pipeline(args):
     train_policy = make_train
     collect_stream = iter_policy_transitions
+    achievement_indices = {
+        "all": None,
+        "no_eat_plant": NO_EAT_PLANT_ACHIEVEMENT_INDICES,
+        "easy17": EASY17_ACHIEVEMENT_INDICES,
+    }[args.discovery_achievement_subset]
+    oracle_source = (
+        Path(args.oracle_graph).expanduser().resolve()
+        if args.oracle_graph is not None
+        else None
+    )
+    oracle_graph = (
+        load_oracle_graph(oracle_source) if oracle_source is not None else None
+    )
     if args.discovery_interactions <= 0:
         raise ValueError("--discovery-interactions must be positive")
     if args.contrast_interactions < 0:
@@ -106,9 +214,16 @@ def run_pipeline(args):
     if (output / "config.json").exists():
         raise FileExistsError(f"run already exists: {output}; use a new output directory")
     output.mkdir(parents=True, exist_ok=True)
+    if oracle_source is not None:
+        shutil.copy2(oracle_source, output / "oracle_graph.npz")
+        args.oracle_graph = "oracle_graph.npz"
     symbolic = not args.pixels
     env = make_sea_craftax_classic_env(
-        symbolic=symbolic, idle_timeout=args.idle_timeout
+        symbolic=symbolic,
+        idle_timeout=args.idle_timeout,
+        immortal=args.immortal,
+        health_reward_coef=args.health_reward_coef,
+        combat_damage_mode=args.combat_damage_mode,
     )
     common_ppo = dict(
         num_envs=args.num_envs,
@@ -145,20 +260,18 @@ def run_pipeline(args):
         max_grad_norm=args.discovery_max_grad_norm,
     )
     goal_config = PPOConfig(total_timesteps=args.goal_timesteps, **common_ppo)
+    run_config = {
+        "args": vars(args),
+        "base_ppo": asdict(base_config),
+        "discovery": asdict(discovery_config),
+        "discovery_rollout": asdict(stream_config),
+        "discovery_mean_contrast_coefficient": discovery_config.mean_contrast_coefficient,
+        "goal_ppo": asdict(goal_config),
+    }
     (output / "config.json").write_text(
-        json.dumps(
-            {
-                "args": vars(args),
-                "base_ppo": asdict(base_config),
-                "discovery": asdict(discovery_config),
-                "discovery_rollout": asdict(stream_config),
-                "discovery_mean_contrast_coefficient": discovery_config.mean_contrast_coefficient,
-                "goal_ppo": asdict(goal_config),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+        json.dumps(run_config, indent=2), encoding="utf-8"
     )
+    wandb_logger = _WandbLogger(args, run_config)
 
     started = time.perf_counter()
     if args.base_policy_checkpoint:
@@ -173,7 +286,7 @@ def run_pipeline(args):
         print("[1/5] training frozen collection policy")
         base_result = jax.jit(train_policy(
             base_config, env, pixel=args.pixels,
-            progress_callback=_progress_reporter(output, "base", base_config),
+            progress_callback=_progress_reporter(output, "base", base_config, wandb_logger),
             progress_interval=args.log_interval,
         ))(
             jax.random.PRNGKey(args.seed)
@@ -188,6 +301,7 @@ def run_pipeline(args):
         print(base_metrics)
 
     if args.base_only:
+        wandb_logger.finish()
         print("base-only pipeline complete", flush=True)
         return
 
@@ -199,9 +313,20 @@ def run_pipeline(args):
             raise FloatingPointError(f"non-finite encoder metrics at update {update}")
         with (output / "encoder_progress.jsonl").open("a") as handle:
             handle.write(json.dumps(record) + "\n")
-        print(f"[encoder] {record}", flush=True)
+        wandb_logger.log_encoder(update, metrics, counters)
+        tqdm.write(f"[encoder] {record}")
 
     print("[2-3/5] collecting fresh transitions and training SEA encoder")
+    encoder_bar = tqdm(
+        total=discovery_config.train_steps,
+        desc="[2-3/5] SEA encoder",
+        unit="update",
+        dynamic_ncols=True,
+    )
+
+    def encoder_step(update, interactions):
+        encoder_bar.update(max(0, update - encoder_bar.n))
+        encoder_bar.set_postfix(interactions=f"{interactions / 1e6:.2f}M")
     stream = collect_stream(
         env, base_params, stream_config, interactions=args.discovery_interactions,
         pixel=args.pixels, seed=args.seed + 1, chunk_steps=stream_config.num_steps,
@@ -209,9 +334,15 @@ def run_pipeline(args):
     result = train_streaming_encoder(
         stream, discovery_config, contrast_interactions=args.contrast_interactions,
         pixel=args.pixels, seed=args.seed + 2, progress_callback=encoder_progress,
+        achievement_indices=achievement_indices, step_callback=encoder_step,
     )
+    encoder_bar.close()
     if result.summary["prediction_transitions_seen"] != args.discovery_interactions:
         raise RuntimeError("encoder did not consume the full fresh-transition budget")
+    result.summary["achievement_subset"] = args.discovery_achievement_subset
+    result.summary["achievement_indices"] = (
+        None if achievement_indices is None else list(achievement_indices)
+    )
     (output / "discovery_summary.json").write_text(json.dumps(result.summary, indent=2))
     if result.contrast_dataset is not None:
         result.contrast_dataset.save(output / "contrast_episode_dataset.npz")
@@ -234,9 +365,26 @@ def run_pipeline(args):
         env, base_params, stream_config, interactions=args.clustering_interactions,
         pixel=args.pixels, seed=args.seed + 4, chunk_steps=args.collect_chunk_steps,
     )
+    clustering_bar = tqdm(
+        total=args.clustering_interactions,
+        desc="[4/5] clustering collection",
+        unit="interaction",
+        unit_scale=True,
+        dynamic_ncols=True,
+    )
+
+    def clustering_progress(consumed, positives):
+        clustering_bar.update(max(0, consumed - clustering_bar.n))
+        clustering_bar.set_postfix(
+            positives=f"{positives}/{args.clustering_transitions}"
+        )
+
     dataset, clustering_consumed = collect_clustering_dataset(
         clustering_stream, max_transitions=args.clustering_transitions,
+        achievement_indices=achievement_indices,
+        progress_callback=clustering_progress,
     )
+    clustering_bar.close()
     clustering_stream.close()
     dataset.save(output / "clustering_dataset.npz")
     (output / "clustering_collection.json").write_text(json.dumps({
@@ -264,18 +412,33 @@ def run_pipeline(args):
     )
 
     if args.stop_after_clustering:
+        wandb_logger.finish()
         print(f"encoder/clustering pipeline finished in {time.perf_counter() - started:.1f}s")
         return
 
-    print("[5/5] training graph-conditioned PPO-RNN")
+    graph_kind = "oracle" if oracle_graph is not None else "learned"
+    print(f"[5/5] training {graph_kind}-graph-conditioned PPO-RNN")
     goal_runtime = GoalRuntime(
         transition_network=encoder,
         transition_params=encoder_state.params,
-        centroids=jnp.asarray(artifacts.centroids),
-        threshold=artifacts.threshold,
-        graph=jnp.asarray(artifacts.graph),
+        centroids=jnp.asarray(
+            artifacts.centroids
+            if oracle_graph is None
+            else np.zeros((len(oracle_graph.achievement_ids), 1), dtype=np.float32)
+        ),
+        threshold=artifacts.threshold if oracle_graph is None else 0.0,
+        graph=jnp.asarray(
+            artifacts.graph if oracle_graph is None else oracle_graph.graph
+        ),
         exploration_reward_coefficient=args.exploration_reward_coefficient,
+        goal_success_coefficient=args.goal_success_coefficient,
+        non_target_achievement_coefficient=(
+            args.non_target_achievement_coefficient
+        ),
         include_new_tasks=not args.no_new_tasks,
+        oracle_achievement_ids=(
+            None if oracle_graph is None else oracle_graph.achievement_ids
+        ),
     )
     goal_result = jax.jit(
         train_policy(
@@ -283,7 +446,7 @@ def run_pipeline(args):
             env,
             pixel=args.pixels,
             goal_runtime=goal_runtime,
-            progress_callback=_progress_reporter(output, "goal", goal_config),
+            progress_callback=_progress_reporter(output, "goal", goal_config, wandb_logger),
             progress_interval=args.log_interval,
         )
     )(jax.random.PRNGKey(args.seed + 3))
@@ -294,6 +457,7 @@ def run_pipeline(args):
         output / "goal_metrics.json", goal_result["metrics"]
     )
     print(goal_metrics)
+    wandb_logger.finish()
     print(f"pipeline finished in {time.perf_counter() - started:.1f}s")
 
 
@@ -319,7 +483,23 @@ def build_parser():
     parser.add_argument("--base-policy-checkpoint", help="reuse a saved collection policy and skip base PPO training")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--wandb-project", help="enable W&B logging for this project")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-name")
+    parser.add_argument("--wandb-group")
+    parser.add_argument(
+        "--wandb-mode", choices=("online", "offline", "disabled"), default="online"
+    )
+    parser.add_argument("--wandb-tags", nargs="*", default=None)
     parser.add_argument("--idle-timeout", type=int, default=100)
+    parser.add_argument("--immortal", type=_parse_bool, default=True)
+    parser.add_argument("--health-reward-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--combat-damage-mode",
+        choices=("lethal-only", "cumulative"),
+        default="lethal-only",
+        help="lethal-only preserves SEA combat; cumulative preserves chip damage",
+    )
     parser.add_argument("--base-timesteps", type=int, default=200_000_000)
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--discovery-interactions", type=int, default=50_000_000)
@@ -347,6 +527,15 @@ def build_parser():
     parser.add_argument("--embedding-size", type=int, default=256)
     parser.add_argument("--discovery-learning-rate", type=float, default=1e-4)
     parser.add_argument(
+        "--discovery-achievement-subset",
+        choices=("all", "no_eat_plant", "easy17"),
+        default="all",
+        help=(
+            "achievement events used by encoder contrast/prediction and clustering; "
+            "excluded achievement-only transitions are masked, not treated as negatives"
+        ),
+    )
+    parser.add_argument(
         "--contrast-weight",
         type=float,
         default=20.0,
@@ -361,7 +550,26 @@ def build_parser():
     parser.add_argument("--min-clusters", type=int)
     parser.add_argument("--max-clusters", type=int, default=30)
     parser.add_argument("--exploration-reward-coefficient", type=float, default=0.1)
+    parser.add_argument(
+        "--goal-success-coefficient",
+        type=float,
+        default=5.0,
+        help="SEA target-achievement reward scale; default: 5",
+    )
+    parser.add_argument(
+        "--non-target-achievement-coefficient",
+        type=float,
+        default=1.0,
+        help="SEA non-target achievement reward scale; default: 1",
+    )
     parser.add_argument("--no-new-tasks", action="store_true")
+    parser.add_argument(
+        "--oracle-graph",
+        help=(
+            "achievement-indexed .npz DAG with graph and achievement_ids; "
+            "uses exact achievement events instead of learned cluster labels"
+        ),
+    )
     parser.add_argument(
         "--stop-after-clustering",
         action="store_true",

@@ -50,7 +50,7 @@ def add_contrast_events(
 
 def train_streaming_encoder(batches, config, *, contrast_interactions=1_000_000,
                             pixel=False, seed=0, progress_callback=None,
-                            achievement_indices=None):
+                            achievement_indices=None, step_callback=None):
     """Use every incoming transition once for prediction, with no oversampling.
 
     Each batch is a newly generated rollout. The completed-episode FIFO evolves
@@ -113,6 +113,8 @@ def train_streaming_encoder(batches, config, *, contrast_interactions=1_000_000,
         prediction_examples += int(prediction_valid.sum())
         excluded_events += int((~prediction_valid).sum())
         updates += 1
+        if step_callback is not None:
+            step_callback(updates, seen)
         if progress_callback is not None and (updates == 1 or updates % 500 == 0 or updates == config.train_steps):
             progress_callback(updates, metrics, {
                 'prediction_transitions_seen': seen,
@@ -150,7 +152,8 @@ def train_streaming_encoder(batches, config, *, contrast_interactions=1_000_000,
 
 
 def collect_clustering_dataset(
-    batches, max_transitions=10_000, achievement_indices=None
+    batches, max_transitions=10_000, achievement_indices=None,
+    progress_callback=None,
 ):
     """Keep the first N positive transitions from an independent fresh rollout."""
     if max_transitions < 2:
@@ -173,6 +176,8 @@ def collect_clustering_dataset(
                 values['event_count'] = masked.sum(axis=1).astype(np.float32)
             chunks.append(values)
             count += len(indices)
+        if progress_callback is not None:
+            progress_callback(consumed, count)
         if count == max_transitions:
             break
     if count != max_transitions:

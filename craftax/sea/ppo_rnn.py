@@ -223,8 +223,9 @@ def make_train(
                         action,
                         info["terminal_obs"],
                         env_done,
-                        reward,
+                        info["event_count"],
                         new_achievements=info["new_achievements"],
+                        health_reward=reward - info["event_count"],
                     )
                 bootstrap_done = env_done | goal_done
                 next_reset = (

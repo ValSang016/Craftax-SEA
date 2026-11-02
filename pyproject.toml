@@ -34,6 +34,8 @@ sea = [
     "optax",
     "scikit-learn",
     "pytest",
+    "tqdm",
+    "wandb",
 ]
 
 [project.scripts]

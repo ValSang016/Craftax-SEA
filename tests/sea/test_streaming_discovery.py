@@ -189,19 +189,45 @@ def test_cli_rejects_offline_replay_and_inconsistent_update_budget(tmp_path):
     assert not (tmp_path/'run').exists()
 
 
-def test_cli_exposes_contrast_weight_and_encoder_only_mode():
+def test_cli_exposes_contrast_weight_subset_and_encoder_only_mode():
     from craftax.sea.train import build_parser
     args = build_parser().parse_args([
-        '--contrast-weight', '2.0', '--stop-after-clustering'
+        '--contrast-weight', '2.0',
+        '--discovery-achievement-subset', 'no_eat_plant',
+        '--stop-after-clustering',
     ])
     assert args.contrast_weight == 2.0
+    assert args.discovery_achievement_subset == 'no_eat_plant'
     assert args.stop_after_clustering
 
 
-def test_easy17_definition_excludes_hard4_and_eat_plant():
+def test_cli_exposes_optional_wandb_configuration():
+    from craftax.sea.train import build_parser
+    args = build_parser().parse_args([
+        '--wandb-project', 'craftax-sea',
+        '--wandb-entity', 'research-team',
+        '--wandb-name', 'coef003-seed0',
+        '--wandb-group', 'coef003',
+        '--wandb-mode', 'offline',
+        '--wandb-tags', 'sea', 'coef-0.03',
+    ])
+    assert args.wandb_project == 'craftax-sea'
+    assert args.wandb_entity == 'research-team'
+    assert args.wandb_name == 'coef003-seed0'
+    assert args.wandb_group == 'coef003'
+    assert args.wandb_mode == 'offline'
+    assert args.wandb_tags == ['sea', 'coef-0.03']
+
+
+def test_subset_definitions_exclude_the_intended_achievements():
     from craftax.sea.metrics import (
         ACHIEVEMENT_NAMES, EASY17_ACHIEVEMENT_INDICES, HARD_ACHIEVEMENT_INDICES,
+        NO_EAT_PLANT_ACHIEVEMENT_INDICES,
     )
+    eat_plant = ACHIEVEMENT_NAMES.index('eat_plant')
+    assert len(NO_EAT_PLANT_ACHIEVEMENT_INDICES) == 21
+    assert eat_plant not in NO_EAT_PLANT_ACHIEVEMENT_INDICES
+    assert set(HARD_ACHIEVEMENT_INDICES) < set(NO_EAT_PLANT_ACHIEVEMENT_INDICES)
     assert len(EASY17_ACHIEVEMENT_INDICES) == 17
     assert not set(EASY17_ACHIEVEMENT_INDICES) & set(HARD_ACHIEVEMENT_INDICES)
-    assert ACHIEVEMENT_NAMES.index('eat_plant') not in EASY17_ACHIEVEMENT_INDICES
+    assert eat_plant not in EASY17_ACHIEVEMENT_INDICES

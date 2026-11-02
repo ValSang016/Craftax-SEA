@@ -22,10 +22,13 @@ EASY_ACHIEVEMENT_INDICES = tuple(
     for index in range(len(ACHIEVEMENT_NAMES))
     if index not in HARD_ACHIEVEMENT_INDICES
 )
+NO_EAT_PLANT_ACHIEVEMENT_INDICES = tuple(
+    index for index, name in enumerate(ACHIEVEMENT_NAMES) if name != "eat_plant"
+)
 EASY17_ACHIEVEMENT_INDICES = tuple(
     index
-    for index, name in enumerate(ACHIEVEMENT_NAMES)
-    if index not in HARD_ACHIEVEMENT_INDICES and name != "eat_plant"
+    for index in NO_EAT_PLANT_ACHIEVEMENT_INDICES
+    if index not in HARD_ACHIEVEMENT_INDICES
 )
 
 
@@ -113,6 +116,7 @@ __all__ = [
     "EASY_ACHIEVEMENT_INDICES",
     "EASY17_ACHIEVEMENT_INDICES",
     "HARD_ACHIEVEMENT_INDICES",
+    "NO_EAT_PLANT_ACHIEVEMENT_INDICES",
     "rollout_episode_metrics",
     "summarize_training_metrics",
 ]
