@@ -23,6 +23,7 @@ from craftax.sea.discovery import (
     fit_clusters,
     summarize_cluster_achievements,
 )
+from craftax.sea.dynamic_graph import DynamicGraphConfig
 from craftax.sea.env import make_sea_craftax_classic_env
 from craftax.sea.goal import GoalRuntime, load_oracle_graph
 from craftax.sea.metrics import (
@@ -77,6 +78,13 @@ class _WandbLogger:
             array = np.asarray(value)
             if array.ndim == 0:
                 values[name] = float(array)
+            elif name == "selected_goal_distribution" and array.ndim == 1:
+                values.update(
+                    {
+                        f"selected_goal_probability_{index}": float(probability)
+                        for index, probability in enumerate(array)
+                    }
+                )
         return values
 
     def log_policy(self, stage, steps, metrics, steps_per_second=None):
@@ -148,10 +156,22 @@ def _progress_reporter(output, stage, config, wandb_logger=None):
         previous[:] = [steps, now]
         if not all(np.isfinite(value).all() for value in metrics.values()):
             raise FloatingPointError(f"non-finite {stage} metrics at update {update}")
+        checkpoint_params = params
+        q_checkpoint_params = None
+        if isinstance(params, dict) and "policy" in params:
+            checkpoint_params = params["policy"]
+            q_checkpoint_params = {
+                name: value for name, value in params.items() if name != "policy"
+            }
         checkpoint = output / f"{stage}_policy_latest.msgpack"
         temporary = checkpoint.with_suffix(".tmp")
-        save_params(temporary, params)
+        save_params(temporary, checkpoint_params)
         temporary.replace(checkpoint)
+        if q_checkpoint_params is not None:
+            q_checkpoint = output / "high_level_q_latest.msgpack"
+            q_temporary = q_checkpoint.with_suffix(".tmp")
+            save_params(q_temporary, q_checkpoint_params)
+            q_temporary.replace(q_checkpoint)
         with (output / "progress.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
         status = output / "progress.tmp"
@@ -260,6 +280,20 @@ def run_pipeline(args):
         max_grad_norm=args.discovery_max_grad_norm,
     )
     goal_config = PPOConfig(total_timesteps=args.goal_timesteps, **common_ppo)
+    dynamic_config = None
+    if symbolic and args.high_level_controller == "residual":
+        dynamic_config = DynamicGraphConfig(
+            warmup_steps=args.dynamic_warmup_steps,
+            residual_weight=args.dynamic_beta,
+            temperature=args.dynamic_temperature,
+            replay_capacity=args.high_level_replay_capacity,
+            batch_size=args.high_level_q_batch_size,
+            learning_rate=args.high_level_q_learning_rate,
+            high_level_q_replay_ratio=args.high_level_q_replay_ratio,
+            min_replay_size=args.high_level_min_replay_size,
+            goal_timeout=args.high_level_goal_timeout,
+        )
+        dynamic_config.validate()
     run_config = {
         "args": vars(args),
         "base_ppo": asdict(base_config),
@@ -267,6 +301,10 @@ def run_pipeline(args):
         "discovery_rollout": asdict(stream_config),
         "discovery_mean_contrast_coefficient": discovery_config.mean_contrast_coefficient,
         "goal_ppo": asdict(goal_config),
+        "dynamic_graph": (
+            None if dynamic_config is None else asdict(dynamic_config)
+        ),
+        "oracle_direct": oracle_graph is not None,
     }
     (output / "config.json").write_text(
         json.dumps(run_config, indent=2), encoding="utf-8"
@@ -274,6 +312,73 @@ def run_pipeline(args):
     wandb_logger = _WandbLogger(args, run_config)
 
     started = time.perf_counter()
+    if oracle_graph is not None:
+        print(
+            "[oracle-direct] skipping base PPO, encoder discovery, and clustering",
+            flush=True,
+        )
+        goal_runtime = GoalRuntime(
+            transition_network=None,
+            transition_params=None,
+            centroids=jnp.zeros(
+                (len(oracle_graph.achievement_ids), 1), dtype=jnp.float32
+            ),
+            threshold=0.0,
+            graph=jnp.asarray(oracle_graph.graph),
+            exploration_reward_coefficient=args.exploration_reward_coefficient,
+            goal_success_coefficient=args.goal_success_coefficient,
+            non_target_achievement_coefficient=(
+                args.non_target_achievement_coefficient
+            ),
+            include_new_tasks=not args.no_new_tasks,
+            oracle_achievement_ids=oracle_graph.achievement_ids,
+        )
+        print(
+            "[5/5] training oracle-graph-conditioned PPO-RNN; "
+            f"controller={args.high_level_controller}, "
+            f"objectives={goal_runtime.num_objectives}",
+            flush=True,
+        )
+        goal_result = jax.jit(
+            train_policy(
+                goal_config,
+                env,
+                pixel=args.pixels,
+                goal_runtime=goal_runtime,
+                dynamic_config=dynamic_config,
+                progress_callback=_progress_reporter(
+                    output, "goal", goal_config, wandb_logger
+                ),
+                progress_interval=args.log_interval,
+            )
+        )(jax.random.PRNGKey(args.seed + 3))
+        jax.block_until_ready(goal_result["metrics"]["loss"])
+        jax.effects_barrier()
+        save_params(
+            output / "goal_policy.msgpack",
+            goal_result["runner_state"][0].params,
+        )
+        if dynamic_config is not None:
+            dynamic_state = goal_result["runner_state"][7]
+            save_params(
+                output / "high_level_q.msgpack",
+                {
+                    "full_q": dynamic_state.q_state.full_q.params,
+                    "base_q": dynamic_state.q_state.base_q.params,
+                    "target_full_q": dynamic_state.q_state.target_full_params,
+                },
+            )
+        goal_metrics = _save_metric_summary(
+            output / "goal_metrics.json", goal_result["metrics"]
+        )
+        print(goal_metrics)
+        wandb_logger.finish()
+        print(
+            f"oracle-direct pipeline finished in "
+            f"{time.perf_counter() - started:.1f}s"
+        )
+        return
+
     if args.base_policy_checkpoint:
         checkpoint = Path(args.base_policy_checkpoint).resolve()
         print(f"[1/5] reusing frozen collection policy: {checkpoint}")
@@ -446,13 +551,26 @@ def run_pipeline(args):
             env,
             pixel=args.pixels,
             goal_runtime=goal_runtime,
-            progress_callback=_progress_reporter(output, "goal", goal_config, wandb_logger),
+            dynamic_config=dynamic_config,
+            progress_callback=_progress_reporter(
+                output, "goal", goal_config, wandb_logger
+            ),
             progress_interval=args.log_interval,
         )
     )(jax.random.PRNGKey(args.seed + 3))
     jax.block_until_ready(goal_result["metrics"]["loss"])
     jax.effects_barrier()
     save_params(output / "goal_policy.msgpack", goal_result["runner_state"][0].params)
+    if dynamic_config is not None:
+        dynamic_state = goal_result["runner_state"][7]
+        save_params(
+            output / "high_level_q.msgpack",
+            {
+                "full_q": dynamic_state.q_state.full_q.params,
+                "base_q": dynamic_state.q_state.base_q.params,
+                "target_full_q": dynamic_state.q_state.target_full_params,
+            },
+        )
     goal_metrics = _save_metric_summary(
         output / "goal_metrics.json", goal_result["metrics"]
     )
@@ -473,10 +591,11 @@ def build_parser():
         help="use raw pixel observations (default and primary experiment)",
     )
     observation_group.add_argument(
+        "--symbolic",
         "--symbolic-debug",
         dest="pixels",
         action="store_false",
-        help="use symbolic observations for fast debugging only",
+        help="use symbolic observations and state-conditioned dynamic graph training",
     )
     parser.set_defaults(pixels=True)
     parser.add_argument("--discovery-dataset-checkpoint", help="legacy option; rejected because discovery now requires fresh rollouts")
@@ -565,11 +684,41 @@ def build_parser():
     parser.add_argument("--no-new-tasks", action="store_true")
     parser.add_argument(
         "--oracle-graph",
+        "--graph-path",
+        dest="oracle_graph",
         help=(
             "achievement-indexed .npz DAG with graph and achievement_ids; "
-            "uses exact achievement events instead of learned cluster labels"
+            "uses the loaded graph in the same goal-training pipeline"
         ),
     )
+    parser.add_argument(
+        "--high-level-controller",
+        choices=("residual", "sea-meta-controller"),
+        default="residual",
+        help=(
+            "symbolic high-level goal selector: state-conditioned Q residual "
+            "(default) or SEA's original graph meta-controller"
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-warmup-steps", type=int, default=30_000_000
+    )
+    parser.add_argument("--dynamic-beta", "--beta", type=float, default=1.0)
+    parser.add_argument("--dynamic-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--high-level-replay-capacity", type=int, default=100_000
+    )
+    parser.add_argument("--high-level-q-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--high-level-q-learning-rate", type=float, default=1e-4
+    )
+    parser.add_argument(
+        "--high-level-q-replay-ratio", type=float, default=4.0
+    )
+    parser.add_argument(
+        "--high-level-min-replay-size", type=int, default=1024
+    )
+    parser.add_argument("--high-level-goal-timeout", type=int, default=300)
     parser.add_argument(
         "--stop-after-clustering",
         action="store_true",

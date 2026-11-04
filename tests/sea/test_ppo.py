@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from craftax.sea.dynamic_graph import DynamicGraphConfig
 from craftax.sea.env import make_sea_craftax_classic_env
 from craftax.sea.goal import GoalRuntime
 from craftax.sea.metrics import rollout_episode_metrics, summarize_training_metrics
@@ -36,7 +37,25 @@ def test_training_cli_defaults_to_pixels():
     assert defaults.clustering_transitions == 10_000
     assert defaults.discovery_batch_size == 2560
     assert defaults.discovery_num_envs == 32
+    assert defaults.dynamic_warmup_steps == 30_000_000
+    assert defaults.dynamic_beta == 1.0
+    assert defaults.dynamic_temperature == 1.0
+    assert defaults.high_level_controller == "residual"
+    assert defaults.high_level_replay_capacity == 100_000
+    assert defaults.high_level_q_batch_size == 256
+    assert defaults.high_level_q_learning_rate == 1e-4
+    assert defaults.high_level_q_replay_ratio == 4.0
+    assert defaults.high_level_min_replay_size == 1024
+    assert defaults.high_level_goal_timeout == 300
     assert parser.parse_args(["--symbolic-debug"]).pixels is False
+    assert parser.parse_args(["--symbolic"]).pixels is False
+    assert parser.parse_args(["--graph-path", "graph.npz"]).oracle_graph == "graph.npz"
+    assert (
+        parser.parse_args(
+            ["--high-level-controller", "sea-meta-controller"]
+        ).high_level_controller
+        == "sea-meta-controller"
+    )
 
 
 def test_goal_boundary_cuts_gae_bootstrap():
@@ -201,3 +220,57 @@ def test_goal_conditioned_ppo_smoke_update_is_finite():
         jax.random.PRNGKey(10)
     )
     assert jnp.isfinite(result["metrics"]["loss"]).all()
+
+
+def test_dynamic_goal_training_updates_replay_and_q_together():
+    env = make_sea_craftax_classic_env(symbolic=True, idle_timeout=8)
+    runtime = GoalRuntime(
+        transition_network=None,
+        transition_params=None,
+        centroids=jnp.zeros((2, 1), dtype=jnp.float32),
+        threshold=0.0,
+        graph=jnp.asarray([[0, 1], [0, 0]], dtype=jnp.int8),
+        include_new_tasks=False,
+        oracle_achievement_ids=(0, 5),
+    )
+    config = PPOConfig(
+        total_timesteps=16,
+        num_envs=2,
+        num_steps=4,
+        update_epochs=1,
+        num_minibatches=1,
+        hidden_size=16,
+        reset_ratio=1,
+    )
+    dynamic = DynamicGraphConfig(
+        warmup_steps=4,
+        replay_capacity=16,
+        batch_size=2,
+        high_level_q_replay_ratio=4.0,
+        min_replay_size=16,
+        goal_timeout=1,
+    )
+    result = jax.jit(
+        make_train(
+            config,
+            env,
+            pixel=False,
+            goal_runtime=runtime,
+            dynamic_config=dynamic,
+        )
+    )(jax.random.PRNGKey(11))
+    metrics = result["metrics"]
+    assert jnp.isfinite(metrics["full_q_loss"]).all()
+    assert jnp.isfinite(metrics["base_q_loss"]).all()
+    assert int(result["runner_state"][7].replay.size) == 16
+    assert int(result["runner_state"][7].q_state.full_q.step) == 16
+    assert int(result["runner_state"][7].q_state.base_q.step) == 16
+    np.testing.assert_array_equal(
+        metrics["high_level_q_update_count"], [0, 16]
+    )
+    assert jnp.allclose(
+        metrics["uniform_selection_fraction"]
+        + metrics["dynamic_selection_fraction"],
+        1.0,
+    )
+    assert jnp.allclose(metrics["mean_high_level_duration"], 1.0)

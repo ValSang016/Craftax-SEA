@@ -15,6 +15,7 @@ from flax import serialization
 
 from craftax.sea.checkpoint import save_params
 from craftax.sea.discovery import ClusterArtifacts
+from craftax.sea.dynamic_graph import DynamicGraphConfig
 from craftax.sea.env import make_sea_craftax_classic_env
 from craftax.sea.goal import GoalRuntime, load_oracle_graph
 from craftax.sea.networks import TransitionEncoder
@@ -92,6 +93,12 @@ def run(args):
     goal_config = PPOConfig(**source_config["goal_ppo"])
     if args.goal_timesteps is not None:
         goal_config = replace(goal_config, total_timesteps=args.goal_timesteps)
+    dynamic_config = None
+    if not pixel:
+        dynamic_config = DynamicGraphConfig(
+            **(source_config.get("dynamic_graph") or {})
+        )
+        dynamic_config.validate()
 
     discovery = source_config["discovery"]
     encoder = TransitionEncoder(
@@ -140,6 +147,9 @@ def run(args):
         }
     )
     run_config["goal_ppo"] = vars(goal_config)
+    run_config["dynamic_graph"] = (
+        None if dynamic_config is None else vars(dynamic_config)
+    )
     (output / "config.json").write_text(
         json.dumps(run_config, indent=2), encoding="utf-8"
     )
@@ -193,6 +203,7 @@ def run(args):
                 env,
                 pixel=pixel,
                 goal_runtime=runtime,
+                dynamic_config=dynamic_config,
                 progress_callback=_progress_reporter(
                     output, "goal", goal_config, wandb_logger
                 ),
@@ -202,6 +213,16 @@ def run(args):
         jax.block_until_ready(result["metrics"]["loss"])
         jax.effects_barrier()
         save_params(output / "goal_policy.msgpack", result["runner_state"][0].params)
+        if dynamic_config is not None:
+            dynamic_state = result["runner_state"][7]
+            save_params(
+                output / "high_level_q.msgpack",
+                {
+                    "full_q": dynamic_state.q_state.full_q.params,
+                    "base_q": dynamic_state.q_state.base_q.params,
+                    "target_full_q": dynamic_state.q_state.target_full_params,
+                },
+            )
         metrics = _save_metric_summary(output / "goal_metrics.json", result["metrics"])
         print(metrics)
         print(f"goal-only training finished in {time.perf_counter() - started:.1f}s")
@@ -235,6 +256,8 @@ def build_parser():
     )
     parser.add_argument(
         "--oracle-graph",
+        "--graph-path",
+        dest="oracle_graph",
         help=(
             "achievement-indexed .npz DAG with graph and achievement_ids; "
             "defaults to source/oracle_graph.npz when present"

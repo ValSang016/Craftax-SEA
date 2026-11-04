@@ -209,10 +209,9 @@ def initialize_goal_state(key, num_envs, graph, include_new_tasks=True):
     return GoalState(objective, completed, last_completed)
 
 
-def apply_goal_transition(
+def advance_goal_progress(
     runtime: GoalRuntime,
     goal_state: GoalState,
-    key,
     observation,
     action,
     next_observation,
@@ -221,7 +220,7 @@ def apply_goal_transition(
     new_achievements=None,
     health_reward=0.0,
 ):
-    """Classify an event, shape reward and update the meta-controller."""
+    """Classify an event and update progress without selecting another goal."""
 
     if runtime.oracle_achievement_ids is not None:
         if new_achievements is None:
@@ -274,22 +273,71 @@ def apply_goal_transition(
     last_completed = jnp.where(
         event_happened, predicted_class, goal_state.last_completed
     )
+    transition_completed = completed
+    transition_last_completed = last_completed
 
-    # A physical reset clears option history; a goal event regenerates the
-    # objective while preserving the physical Craftax state.
     completed = jnp.where(env_done[:, None], False, completed)
     last_completed = jnp.where(env_done, runtime.num_objectives, last_completed)
+    new_goal_state = GoalState(goal_state.objective, completed, last_completed)
+    return (
+        new_goal_state,
+        shaped_reward,
+        goal_done,
+        predicted_class,
+        distance,
+        event_happened,
+        transition_completed,
+        transition_last_completed,
+    )
+
+
+def apply_goal_transition(
+    runtime: GoalRuntime,
+    goal_state: GoalState,
+    key,
+    observation,
+    action,
+    next_observation,
+    env_done,
+    event_count,
+    new_achievements=None,
+    health_reward=0.0,
+):
+    """Classify an event, shape reward and update the legacy meta-controller."""
+
+    (
+        progress_state,
+        shaped_reward,
+        goal_done,
+        predicted_class,
+        distance,
+        event_happened,
+        _,
+        _,
+    ) = advance_goal_progress(
+        runtime,
+        goal_state,
+        observation,
+        action,
+        next_observation,
+        env_done,
+        event_count,
+        new_achievements=new_achievements,
+        health_reward=health_reward,
+    )
+
+    # The legacy SEA path remains available for pixel experiments.
     regenerate = event_happened | env_done
     keys = jax.random.split(key, observation.shape[0])
     selected = select_goals(
         keys,
-        completed,
-        last_completed,
+        progress_state.completed,
+        progress_state.last_completed,
         runtime.graph,
         runtime.include_new_tasks,
     )
     objective = jnp.where(regenerate, selected, goal_state.objective)
-    new_goal_state = GoalState(objective, completed, last_completed)
+    new_goal_state = progress_state.replace(objective=objective)
     return new_goal_state, shaped_reward, goal_done, predicted_class, distance
 
 
@@ -297,6 +345,7 @@ __all__ = [
     "OracleGraph",
     "GoalRuntime",
     "GoalState",
+    "advance_goal_progress",
     "apply_goal_transition",
     "classify_embeddings",
     "initialize_goal_state",

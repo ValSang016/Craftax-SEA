@@ -82,6 +82,8 @@ def summarize_training_metrics(metrics):
             continue
         if value.ndim == 1:
             summary[name] = float(value[-1])
+        elif name == "selected_goal_distribution" and value.ndim == 2:
+            summary[name] = value[-1].tolist()
 
     episode_count = float(arrays["episode_count"].sum())
     achievement_counts = arrays["achievement_success_count"].sum(axis=0)

@@ -12,6 +12,42 @@ env -u LD_LIBRARY_PATH JAX_PLATFORMS=cuda,cpu /opt/conda/envs/craftax/bin/python
 clustering 표본 10k events → goal PPO 300M. 원본 actor 수와 `num_envs`는
 구현 구조가 다르므로 같은 이름의 숫자로 취급하지 않습니다.
 
+## Symbolic state-conditioned dynamic graph
+
+`--symbolic`은 graph recovery 이후 worker PPO와 high-level `Q_F`/`Q_B`를
+하나의 online run에서 함께 학습합니다. 처음 30M environment steps에는 ready
+candidate를 uniform하게 선택하며 goal 선택용 Q forward/residual 계산은 생략하지만,
+replay 수집과 rollout 종료 후 Q update는 계속 진행합니다. 그 뒤에는
+`A_SEA + beta * (Q_F - Q_B)`를 candidate-mask 후 softmax합니다. High-level option은
+target goal 성공, 기본 300 primitive-step timeout, episode 종료에서만 끝납니다.
+각 PPO rollout 뒤 새 high-level transition 수를 `N_H`, Q batch size를 `B`라 할 때
+`ceil(high_level_q_replay_ratio * N_H / B)`회 batched Q update를 수행합니다.
+기본 replay ratio는 4.0이며, replay가 minimum size에 도달하기 전에는 Q를
+update하지 않습니다. 각 update에서 `Q_F`와 `Q_B`는 동일 minibatch를 사용합니다.
+
+`--high-level-controller residual`은 state-conditioned Q residual을 사용하며,
+`--high-level-controller sea-meta-controller`는 Q 없이 SEA의 기존
+`80/10/10/5` graph meta-controller를 사용합니다.
+
+Recovered graph:
+
+```bash
+python -m craftax.sea.train --symbolic --output runs/sea-symbolic
+```
+
+Precomputed achievement graph:
+
+```bash
+python -m craftax.sea.train --symbolic --graph-path graph.npz \
+  --no-new-tasks --high-level-goal-timeout 300 \
+  --output runs/sea-symbolic-oracle
+```
+
+Graph artifacts use the existing oracle format: `graph` and `achievement_ids`
+arrays are required, while `achievement_names` is optional. Dynamic Q parameters
+are saved in `high_level_q.msgpack`; per-update high-level metrics are included
+in `goal_metrics_history.npz`.
+
 ## 모듈
 
 | 모듈 | 역할 |
@@ -21,6 +57,7 @@ clustering 표본 10k events → goal PPO 300M. 원본 actor 수와 `num_envs`�
 | `discovery.py` | encoder loss/optimizer, constrained KMeans, artifact |
 | `graph.py` | learned/oracle 공통 temporal graph 생성 및 축약 |
 | `goal.py` | 분류, 목표 선택, 보상 및 oracle 선택 분기 |
+| `dynamic_graph.py` | symbolic state split, high-level replay, Q learning 및 dynamic edge |
 | `ppo_rnn.py`, `networks.py` | 기본 PPO-GRU 및 픽셀 모델 |
 | `env.py`, `vector_env.py`, `rollout.py` | 환경 규칙과 수집 |
 | `metrics.py`, `checkpoint.py` | episode 지표, parameter 저장 |

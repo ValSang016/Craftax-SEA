@@ -8,9 +8,24 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optax
+from flax import struct
 from flax.training.train_state import TrainState
 
+from craftax.sea.dynamic_graph import (
+    HighLevelReplayBuffer,
+    HighLevelTransitionBatch,
+    compute_dynamic_edge_scores,
+    compute_q_update_count,
+    evaluate_high_level_q,
+    get_ready_goal_candidates,
+    high_level_option_done,
+    initialize_high_level_q,
+    select_high_level_goal,
+    update_high_level_q,
+)
 from craftax.sea.goal import (
+    GoalState,
+    advance_goal_progress,
     apply_goal_transition,
     initialize_goal_state,
 )
@@ -63,6 +78,26 @@ class Transition(NamedTuple):
     episode_length: jax.Array
 
 
+class DynamicStepMetrics(NamedTuple):
+    ended: jax.Array
+    success: jax.Array
+    duration: jax.Array
+    selected_goal: jax.Array
+    uniform_selection: jax.Array
+
+
+@struct.dataclass
+class DynamicTrainingState:
+    q_state: object
+    replay: HighLevelReplayBuffer
+    start_observation: jax.Array
+    start_completed: jax.Array
+    start_current_node: jax.Array
+    discounted_reward: jax.Array
+    duration: jax.Array
+    global_env_steps: jax.Array
+
+
 def categorical_log_prob(logits, action):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     return jnp.take_along_axis(log_probs, action[..., None], axis=-1)[..., 0]
@@ -94,18 +129,26 @@ def calculate_gae(transitions, last_value, config: PPOConfig):
 
 
 def make_train(
-    config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None,
-    progress_callback=None, progress_interval: int = 50,
+    config: PPOConfig,
+    env,
+    *,
+    pixel: bool = False,
+    goal_runtime=None,
+    dynamic_config=None,
+    progress_callback=None,
+    progress_interval: int = 50,
 ):
-    """Build a jittable base-policy PPO training function.
-
-    Goal-conditioned reward and pseudo-terminal handling are layered on this
-    same rollout format by :mod:`craftax.sea.goal_ppo`.
-    """
+    """Build a jittable base or joint goal-policy training function."""
 
     config.validate()
     if progress_interval < 1:
         raise ValueError("progress_interval must be positive")
+    if dynamic_config is not None:
+        dynamic_config.validate()
+        if pixel or goal_runtime is None:
+            raise ValueError(
+                "dynamic graph training requires symbolic observations and a goal runtime"
+            )
     vec_env = SeaAutoResetVecEnv(env, config.num_envs, config.reset_ratio)
     params = env.default_params
     num_updates = config.total_timesteps // (config.num_envs * config.num_steps)
@@ -149,15 +192,99 @@ def make_train(
             apply_fn=network.apply, params=network_params, tx=optimizer
         )
 
+        dynamic_state = None
+
+        def sample_goals(selection_key, candidates, scores, use_uniform):
+            keys = jax.random.split(selection_key, config.num_envs)
+            selected, probabilities = jax.vmap(
+                select_high_level_goal, in_axes=(0, 0, 0, None, None)
+            )(
+                keys,
+                candidates,
+                scores,
+                dynamic_config.temperature,
+                use_uniform,
+            )
+            return selected, probabilities
+
+        def choose_uniform_goals(selection_key, completed):
+            candidates = get_ready_goal_candidates(
+                completed, goal_runtime.graph, goal_runtime.include_new_tasks
+            )
+            scores = jnp.zeros(candidates.shape, dtype=jnp.float32)
+            return sample_goals(
+                selection_key, candidates, scores, jnp.asarray(True)
+            )
+
+        def choose_dynamic_goals(
+            selection_key, current_observation, completed, current_node, q_state
+        ):
+            full_values, base_values = evaluate_high_level_q(
+                q_state, current_observation, completed, current_node
+            )
+            candidates = get_ready_goal_candidates(
+                completed, goal_runtime.graph, goal_runtime.include_new_tasks
+            )
+            scores = compute_dynamic_edge_scores(
+                goal_runtime.graph,
+                current_node,
+                full_values,
+                base_values,
+                dynamic_config.residual_weight,
+            )
+            return sample_goals(
+                selection_key, candidates, scores, jnp.asarray(False)
+            )
+
         if goal_runtime is None:
             goal_state = None
-        else:
+        elif dynamic_config is None:
             key, goal_key = jax.random.split(key)
             goal_state = initialize_goal_state(
                 goal_key,
                 config.num_envs,
                 goal_runtime.graph,
                 goal_runtime.include_new_tasks,
+            )
+        else:
+            key, q_key, goal_key = jax.random.split(key, 3)
+            completed = jnp.zeros(
+                (config.num_envs, num_objectives), dtype=bool
+            )
+            current_node = jnp.full(
+                (config.num_envs,), num_objectives, dtype=jnp.int32
+            )
+            q_state = initialize_high_level_q(
+                q_key,
+                observation,
+                completed,
+                current_node,
+                num_objectives,
+                config.hidden_size,
+                dynamic_config.learning_rate,
+            )
+            if dynamic_config.warmup_steps > 0:
+                objective, _ = choose_uniform_goals(goal_key, completed)
+            else:
+                objective, _ = choose_dynamic_goals(
+                    goal_key, observation, completed, current_node, q_state
+                )
+            goal_state = GoalState(objective, completed, current_node)
+            dynamic_state = DynamicTrainingState(
+                q_state=q_state,
+                replay=HighLevelReplayBuffer.create(
+                    dynamic_config.replay_capacity,
+                    observation.shape[1:],
+                    num_objectives,
+                ),
+                start_observation=observation,
+                start_completed=completed,
+                start_current_node=current_node,
+                discounted_reward=jnp.zeros(
+                    (config.num_envs,), dtype=jnp.float32
+                ),
+                duration=jnp.zeros((config.num_envs,), dtype=jnp.int32),
+                global_env_steps=jnp.asarray(0, dtype=jnp.int32),
             )
 
         runner_state = (
@@ -168,6 +295,7 @@ def make_train(
             hidden,
             goal_state,
             key,
+            dynamic_state,
         )
 
         def update(runner_state, _):
@@ -182,6 +310,7 @@ def make_train(
                     hidden,
                     goal_state,
                     key,
+                    dynamic_state,
                 ) = runner_state
                 key, action_key, step_key, goal_key = jax.random.split(key, 4)
                 if goal_runtime is None:
@@ -205,10 +334,12 @@ def make_train(
                 next_observation, env_state, reward, env_done, info = vec_env.step(
                     step_key, env_state, action, params
                 )
+                dynamic_step_metrics = None
                 if goal_runtime is None:
                     goal_done = jnp.zeros_like(env_done)
                     policy_reward = reward
-                else:
+                    bootstrap_done = env_done
+                elif dynamic_config is None:
                     (
                         goal_state,
                         policy_reward,
@@ -227,7 +358,121 @@ def make_train(
                         new_achievements=info["new_achievements"],
                         health_reward=reward - info["event_count"],
                     )
-                bootstrap_done = env_done | goal_done
+                    bootstrap_done = env_done | goal_done
+                else:
+                    (
+                        progress_state,
+                        policy_reward,
+                        goal_done,
+                        _,
+                        _,
+                        _,
+                        transition_completed,
+                        transition_current_node,
+                    ) = advance_goal_progress(
+                        goal_runtime,
+                        goal_state,
+                        observation,
+                        action,
+                        info["terminal_obs"],
+                        env_done,
+                        info["event_count"],
+                        new_achievements=info["new_achievements"],
+                        health_reward=reward - info["event_count"],
+                    )
+                    duration = dynamic_state.duration + 1
+                    discounted_reward = (
+                        dynamic_state.discounted_reward
+                        + (config.gamma ** dynamic_state.duration) * reward
+                    )
+                    option_done = high_level_option_done(
+                        goal_done, duration, env_done, dynamic_config.goal_timeout
+                    )
+                    replay = dynamic_state.replay.add(
+                        HighLevelTransitionBatch(
+                            observation=dynamic_state.start_observation,
+                            completed=dynamic_state.start_completed,
+                            current_node=dynamic_state.start_current_node,
+                            goal=goal_state.objective,
+                            reward=discounted_reward,
+                            next_observation=info["terminal_obs"],
+                            next_completed=transition_completed,
+                            next_current_node=transition_current_node,
+                            duration=duration,
+                            done=env_done,
+                            success=goal_done,
+                        ),
+                        option_done,
+                    )
+                    global_env_steps = (
+                        dynamic_state.global_env_steps + config.num_envs
+                    )
+                    use_uniform = (
+                        global_env_steps < dynamic_config.warmup_steps
+                    )
+
+                    def select_new_goals(_):
+                        def uniform(_):
+                            return choose_uniform_goals(
+                                goal_key, progress_state.completed
+                            )[0]
+
+                        def dynamic(_):
+                            return choose_dynamic_goals(
+                                goal_key,
+                                next_observation,
+                                progress_state.completed,
+                                progress_state.last_completed,
+                                dynamic_state.q_state,
+                            )[0]
+
+                        return jax.lax.cond(
+                            use_uniform, uniform, dynamic, operand=None
+                        )
+
+                    selected = jax.lax.cond(
+                        jnp.any(option_done),
+                        select_new_goals,
+                        lambda _: goal_state.objective,
+                        operand=None,
+                    )
+                    objective = jnp.where(
+                        option_done, selected, goal_state.objective
+                    )
+                    goal_state = progress_state.replace(objective=objective)
+                    dynamic_state = dynamic_state.replace(
+                        replay=replay,
+                        start_observation=jnp.where(
+                            option_done[:, None],
+                            next_observation,
+                            dynamic_state.start_observation,
+                        ),
+                        start_completed=jnp.where(
+                            option_done[:, None],
+                            progress_state.completed,
+                            dynamic_state.start_completed,
+                        ),
+                        start_current_node=jnp.where(
+                            option_done,
+                            progress_state.last_completed,
+                            dynamic_state.start_current_node,
+                        ),
+                        discounted_reward=jnp.where(
+                            option_done, 0.0, discounted_reward
+                        ),
+                        duration=jnp.where(option_done, 0, duration),
+                        global_env_steps=global_env_steps,
+                    )
+                    bootstrap_done = env_done | option_done
+                    dynamic_step_metrics = DynamicStepMetrics(
+                        ended=option_done,
+                        success=goal_done,
+                        duration=duration,
+                        selected_goal=selected,
+                        uniform_selection=jnp.full(
+                            option_done.shape, use_uniform
+                        ),
+                    )
                 next_reset = (
                     bootstrap_done
                     if goal_runtime is None or goal_runtime.reset_rnn_on_goal
@@ -248,6 +493,11 @@ def make_train(
                     info["achievements"],
                     info["episode_length"],
                 )
+                step_output = (
+                    (transition, dynamic_step_metrics)
+                    if dynamic_config is not None
+                    else transition
+                )
                 return (
                     train_state,
                     env_state,
@@ -256,11 +506,17 @@ def make_train(
                     hidden,
                     goal_state,
                     key,
-                ), transition
+                    dynamic_state,
+                ), step_output
 
-            runner_state, transitions = jax.lax.scan(
+            runner_state, rollout = jax.lax.scan(
                 env_step, runner_state, None, length=config.num_steps
             )
+            if dynamic_config is None:
+                transitions = rollout
+                dynamic_rollout = None
+            else:
+                transitions, dynamic_rollout = rollout
             (
                 train_state,
                 env_state,
@@ -269,6 +525,7 @@ def make_train(
                 hidden,
                 goal_state,
                 key,
+                dynamic_state,
             ) = runner_state
             if goal_runtime is None:
                 objective = jnp.zeros((1, config.num_envs), dtype=jnp.int32)
@@ -285,6 +542,75 @@ def make_train(
                 completed,
             )
             advantages, targets = calculate_gae(transitions, last_value[0], config)
+
+            q_metrics = None
+            q_update_count = None
+            if dynamic_config is not None:
+                new_transition_count = dynamic_rollout.ended.astype(
+                    jnp.int32
+                ).sum()
+                requested_q_updates = compute_q_update_count(
+                    new_transition_count,
+                    dynamic_config.batch_size,
+                    dynamic_config.high_level_q_replay_ratio,
+                )
+                q_update_count = jnp.where(
+                    dynamic_state.replay.size
+                    >= dynamic_config.min_replay_size,
+                    requested_q_updates,
+                    0,
+                ).astype(jnp.int32)
+                zero = jnp.asarray(0.0, dtype=jnp.float32)
+                initial_q_metrics = {
+                    "full_q_loss": zero,
+                    "base_q_loss": zero,
+                    "full_q_mean": zero,
+                    "full_q_std": zero,
+                    "base_q_mean": zero,
+                    "base_q_std": zero,
+                    "q_residual_mean": zero,
+                    "q_residual_std": zero,
+                }
+                key, q_update_key = jax.random.split(key)
+
+                def q_update(_, loop_state):
+                    q_state, sample_key, metric_sums = loop_state
+                    sample_key, batch_key = jax.random.split(sample_key)
+                    batch = dynamic_state.replay.sample(
+                        batch_key, dynamic_config.batch_size
+                    )
+                    q_state, update_metrics = update_high_level_q(
+                        q_state,
+                        batch,
+                        goal_runtime.graph,
+                        goal_runtime.include_new_tasks,
+                        config.gamma,
+                    )
+                    metric_sums = jax.tree.map(
+                        lambda total, value: total + value,
+                        metric_sums,
+                        update_metrics,
+                    )
+                    return q_state, sample_key, metric_sums
+
+                q_state, _, q_metric_sums = jax.lax.fori_loop(
+                    0,
+                    q_update_count,
+                    q_update,
+                    (
+                        dynamic_state.q_state,
+                        q_update_key,
+                        initial_q_metrics,
+                    ),
+                )
+                q_metric_denominator = jnp.maximum(
+                    q_update_count.astype(jnp.float32), 1.0
+                )
+                q_metrics = jax.tree.map(
+                    lambda value: value / q_metric_denominator,
+                    q_metric_sums,
+                )
+                dynamic_state = dynamic_state.replace(q_state=q_state)
 
             def epoch(update_state, _):
                 train_state, key = update_state
@@ -389,6 +715,7 @@ def make_train(
                 hidden,
                 goal_state,
                 key,
+                dynamic_state,
             )
             metrics = {
                 "mean_reward": transitions.reward.mean(),
@@ -405,15 +732,70 @@ def make_train(
                     losses[2] > config.max_grad_norm
                 ).mean(),
             }
+            if dynamic_config is not None:
+                ended = dynamic_rollout.ended
+                transition_count = ended.astype(jnp.float32).sum()
+                denominator = jnp.maximum(transition_count, 1.0)
+                selected_counts = (
+                    jax.nn.one_hot(
+                        dynamic_rollout.selected_goal, num_objectives
+                    )
+                    * ended[..., None]
+                ).sum(axis=(0, 1))
+                uniform_count = (
+                    dynamic_rollout.uniform_selection & ended
+                ).astype(jnp.float32).sum()
+                metrics.update(q_metrics)
+                metrics.update(
+                    {
+                        "high_level_replay_size": dynamic_state.replay.size,
+                        "high_level_transition_count": transition_count,
+                        "high_level_q_update_count": q_update_count,
+                        "selected_goal_distribution": (
+                            selected_counts / denominator
+                        ),
+                        "uniform_selection_fraction": (
+                            uniform_count / denominator
+                        ),
+                        "dynamic_selection_fraction": (
+                            (transition_count - uniform_count) / denominator
+                        ),
+                        "selected_goal_success_rate": (
+                            dynamic_rollout.success.astype(jnp.float32).sum()
+                            / denominator
+                        ),
+                        "mean_high_level_duration": (
+                            (
+                                dynamic_rollout.duration
+                                * ended.astype(dynamic_rollout.duration.dtype)
+                            ).astype(jnp.float32).sum()
+                            / denominator
+                        ),
+                    }
+                )
             metrics.update(rollout_episode_metrics(transitions))
             if progress_callback is not None:
                 update_count = train_state.step // (
                     config.update_epochs * config.num_minibatches
                 )
 
+                checkpoint_params = train_state.params
+                if dynamic_config is not None:
+                    checkpoint_params = {
+                        "policy": train_state.params,
+                        "full_q": dynamic_state.q_state.full_q.params,
+                        "base_q": dynamic_state.q_state.base_q.params,
+                        "target_full_q": (
+                            dynamic_state.q_state.target_full_params
+                        ),
+                    }
+
                 def report(_):
                     jax.debug.callback(
-                        progress_callback, update_count, metrics, train_state.params,
+                        progress_callback,
+                        update_count,
+                        metrics,
+                        checkpoint_params,
                         ordered=True,
                     )
 
