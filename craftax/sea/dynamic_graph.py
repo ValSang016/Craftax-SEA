@@ -46,6 +46,10 @@ class DynamicGraphConfig:
     high_level_q_replay_ratio: float = 4.0
     min_replay_size: int = 1024
     goal_timeout: int = 300
+    allow_unready_goals: bool = False
+    allow_completed_goals: bool = False
+    structural_prior_weight: float = 1.0
+    score_source: str = "residual"
 
     def validate(self): 
         # TODO 이거 정리할 수 있으면 하기;
@@ -53,6 +57,10 @@ class DynamicGraphConfig:
             raise ValueError("dynamic warmup steps cannot be negative")
         if not np.isfinite(self.residual_weight):
             raise ValueError("dynamic residual weight must be finite")
+        if not np.isfinite(self.structural_prior_weight) or self.structural_prior_weight < 0:
+            raise ValueError("structural prior weight must be finite and non-negative")
+        if self.score_source not in ("residual", "base-q", "full-q"):
+            raise ValueError("dynamic score source must be residual, base-q, or full-q")
         if not np.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("dynamic softmax temperature must be positive")
         if self.replay_capacity < 1:
@@ -258,16 +266,33 @@ def evaluate_high_level_q(q_state, observation, completed, current_node):
     return full_values, base_values
 
 
-def get_ready_goal_candidates(completed, graph, include_new_tasks=True):
-    """Return unfinished ready goals, with safe fallbacks for degenerate states."""
+def get_goal_candidates(
+    completed,
+    graph,
+    include_new_tasks=True,
+    *,
+    allow_unready_goals=False,
+    allow_completed_goals=False,
+    warmup=False,
+):
+    """Apply prerequisite and episode-completion eligibility independently.
+
+    Warmup always enforces prerequisites. The legacy empty-set fallback is
+    retained: prefer eligible goals, or all graph nodes if all are completed.
+    """
 
     cluster_count = graph.shape[0]
     cluster_completed = completed[..., :cluster_count]
     prerequisites_met = jnp.all(
         ~graph.astype(bool) | cluster_completed[..., :, None], axis=-2
     )
-    remaining = ~cluster_completed
-    ready = prerequisites_met & remaining
+    remaining = (
+        jnp.ones_like(cluster_completed) if allow_completed_goals else ~cluster_completed
+    )
+    prerequisites_allowed = prerequisites_met | (
+        allow_unready_goals & ~jnp.asarray(warmup)
+    )
+    ready = prerequisites_allowed & remaining
     has_ready = jnp.any(ready, axis=-1, keepdims=True)
     has_remaining = jnp.any(remaining, axis=-1, keepdims=True)
     fallback = jnp.where(has_remaining, remaining, jnp.ones_like(remaining))
@@ -280,13 +305,24 @@ def get_ready_goal_candidates(completed, graph, include_new_tasks=True):
     return candidates
 
 
+def get_ready_goal_candidates(completed, graph, include_new_tasks=True):
+    """Backward-compatible ready, unfinished candidate policy."""
+    return get_goal_candidates(completed, graph, include_new_tasks)
+
+
 def compute_q_residual(full_q, base_q):
     return full_q - base_q
 
 
 def compute_dynamic_edge_scores(
-    graph, current_node, full_q, base_q, residual_weight
+    graph, current_node, full_q, base_q, residual_weight, *,
+    structural_prior_weight=1.0, score_source="residual",
 ):
+    """Return lambda*A + beta*signal, preserving the legacy beta argument name.
+
+    Only the selection logits change. Q learning and candidate eligibility are
+    independent of lambda and the selected signal.
+    """
     cluster_count = graph.shape[0]
     safe_node = jnp.clip(current_node, 0, max(cluster_count - 1, 0))
     static_scores = graph[safe_node].astype(jnp.float32)
@@ -298,7 +334,15 @@ def compute_dynamic_edge_scores(
             [(0, 0)] * (static_scores.ndim - 1) + [(0, padding)]
         )
         static_scores = jnp.pad(static_scores, pad_width)
-    return static_scores + residual_weight * compute_q_residual(full_q, base_q)
+    if score_source == "residual":
+        signal = compute_q_residual(full_q, base_q)
+    elif score_source == "base-q":
+        signal = base_q
+    elif score_source == "full-q":
+        signal = full_q
+    else:
+        raise ValueError("dynamic score source must be residual, base-q, or full-q")
+    return structural_prior_weight * static_scores + residual_weight * signal
 
 
 def stable_masked_softmax(scores, candidates, temperature=1.0):
@@ -348,7 +392,10 @@ def base_q_regression_loss(base_values, full_target_values):
     return jnp.square(base_values - jax.lax.stop_gradient(full_target_values)).mean()
 
 
-def update_high_level_q(q_state, batch, graph, include_new_tasks, gamma):
+def update_high_level_q(
+    q_state, batch, graph, include_new_tasks, gamma, *,
+    allow_unready_goals=False, allow_completed_goals=False, warmup=False,
+):
     external_state, internal_state = split_symbolic_state(batch.observation)
     next_external_state, next_internal_state = split_symbolic_state(
         batch.next_observation
@@ -360,8 +407,11 @@ def update_high_level_q(q_state, batch, graph, include_new_tasks, gamma):
         batch.next_current_node,
         next_internal_state,
     )
-    next_candidates = get_ready_goal_candidates(
-        batch.next_completed, graph, include_new_tasks
+    next_candidates = get_goal_candidates(
+        batch.next_completed, graph, include_new_tasks,
+        allow_unready_goals=allow_unready_goals,
+        allow_completed_goals=allow_completed_goals,
+        warmup=warmup,
     )
     targets = jax.lax.stop_gradient(
         compute_smdp_target(
@@ -445,6 +495,7 @@ __all__ = [
     "compute_smdp_target",
     "evaluate_high_level_q",
     "get_ready_goal_candidates",
+    "get_goal_candidates",
     "high_level_option_done",
     "initialize_high_level_q",
     "select_high_level_goal",

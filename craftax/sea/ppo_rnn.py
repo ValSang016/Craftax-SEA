@@ -17,7 +17,7 @@ from craftax.sea.dynamic_graph import (
     compute_dynamic_edge_scores,
     compute_q_update_count,
     evaluate_high_level_q,
-    get_ready_goal_candidates,
+    get_goal_candidates,
     high_level_option_done,
     initialize_high_level_q,
     select_high_level_goal,
@@ -208,8 +208,10 @@ def make_train(
             return selected, probabilities
 
         def choose_uniform_goals(selection_key, completed):
-            candidates = get_ready_goal_candidates(
-                completed, goal_runtime.graph, goal_runtime.include_new_tasks
+            candidates = get_goal_candidates(
+                completed, goal_runtime.graph, goal_runtime.include_new_tasks,
+                allow_completed_goals=dynamic_config.allow_completed_goals,
+                warmup=True,
             )
             scores = jnp.zeros(candidates.shape, dtype=jnp.float32)
             return sample_goals(
@@ -222,8 +224,10 @@ def make_train(
             full_values, base_values = evaluate_high_level_q(
                 q_state, current_observation, completed, current_node
             )
-            candidates = get_ready_goal_candidates(
-                completed, goal_runtime.graph, goal_runtime.include_new_tasks
+            candidates = get_goal_candidates(
+                completed, goal_runtime.graph, goal_runtime.include_new_tasks,
+                allow_unready_goals=dynamic_config.allow_unready_goals,
+                allow_completed_goals=dynamic_config.allow_completed_goals,
             )
             scores = compute_dynamic_edge_scores(
                 goal_runtime.graph,
@@ -231,6 +235,8 @@ def make_train(
                 full_values,
                 base_values,
                 dynamic_config.residual_weight,
+                structural_prior_weight=dynamic_config.structural_prior_weight,
+                score_source=dynamic_config.score_source,
             )
             return sample_goals(
                 selection_key, candidates, scores, jnp.asarray(False)
@@ -379,6 +385,7 @@ def make_train(
                         info["event_count"],
                         new_achievements=info["new_achievements"],
                         health_reward=reward - info["event_count"],
+                        achievement_events=info["achievement_events"],
                     )
                     duration = dynamic_state.duration + 1
                     discounted_reward = (
@@ -585,6 +592,11 @@ def make_train(
                         goal_runtime.graph,
                         goal_runtime.include_new_tasks,
                         config.gamma,
+                        allow_unready_goals=dynamic_config.allow_unready_goals,
+                        allow_completed_goals=dynamic_config.allow_completed_goals,
+                        warmup=(
+                            dynamic_state.global_env_steps < dynamic_config.warmup_steps
+                        ),
                     )
                     metric_sums = jax.tree.map(
                         lambda total, value: total + value,

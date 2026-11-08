@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 
 from craftax.craftax_classic.constants import DIRECTIONS, Achievement, Action
+from craftax.craftax_classic.constants import BlockType
 from craftax.sea.env import (
     _restore_immortal_player,
     _restore_nonlethal_mob_damage,
@@ -215,3 +216,49 @@ def test_cli_exposes_immortal_and_health_reward_settings():
         "--combat-damage-mode", "cumulative"
     ])
     assert cumulative.combat_damage_mode == "cumulative"
+
+
+def test_repeated_drinking_is_an_event_without_repeating_episode_reward():
+    env = make_sea_craftax_classic_env(
+        symbolic=True, immortal=False, track_achievement_events=True,
+    )
+    _, state = env.reset(jax.random.PRNGKey(30))
+    core = state.env_state
+    target = core.player_position + DIRECTIONS[core.player_direction]
+    core = core.replace(
+        map=core.map.at[target[0], target[1]].set(BlockType.WATER.value),
+        player_drink=jnp.int32(2),
+    )
+    state = state.replace(env_state=core)
+    step = jax.jit(env.step_env)
+    _, first, reward1, _, info1 = step(
+        jax.random.PRNGKey(31), state, Action.DO.value, env.default_params,
+    )
+    _, second, reward2, _, info2 = step(
+        jax.random.PRNGKey(32), first, Action.DO.value, env.default_params,
+    )
+    drink = Achievement.COLLECT_DRINK.value
+    assert info1["new_achievements"][drink]
+    assert info1["achievement_events"][drink]
+    assert not info2["new_achievements"][drink]
+    assert info2["achievement_events"][drink]
+    assert second.env_state.achievements[drink]
+    assert reward1 == 1.0 and reward2 == 0.0
+    # Merely retaining the cumulative bit is not another performance event.
+    _, _, _, _, idle_info = step(
+        jax.random.PRNGKey(33), second, Action.NOOP.value, env.default_params,
+    )
+    assert not idle_info["achievement_events"][drink]
+
+
+def test_event_tracking_preserves_physical_state_and_environment_reward():
+    key = jax.random.PRNGKey(34)
+    regular = make_sea_craftax_classic_env(symbolic=True)
+    tracking = make_sea_craftax_classic_env(symbolic=True, track_achievement_events=True)
+    _, state = regular.reset(key)
+    core = state.env_state.replace(achievements=jnp.ones_like(state.env_state.achievements))
+    state = state.replace(env_state=core)
+    left = regular.step_env(key, state, Action.NOOP.value, regular.default_params)
+    right = tracking.step_env(key, state, Action.NOOP.value, tracking.default_params)
+    for x, y in zip(jax.tree.leaves(left[:4]), jax.tree.leaves(right[:4])):
+        assert jnp.array_equal(x, y)

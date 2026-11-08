@@ -10,6 +10,7 @@ from craftax.sea.goal import (
     load_oracle_graph,
     select_goals,
     shape_goal_reward,
+    advance_goal_progress,
 )
 
 
@@ -48,6 +49,60 @@ def _runtime():
         graph=jnp.zeros((2, 2), dtype=jnp.int8), include_new_tasks=True,
         oracle_achievement_ids=(0, 1),
     )
+
+
+@pytest.mark.parametrize("allow_completed", [False, True])
+def test_repeated_target_success_does_not_erase_simultaneous_novel_reward(allow_completed):
+    runtime = GoalRuntime(
+        transition_network=None, transition_params=None,
+        centroids=jnp.zeros((2, 1)), threshold=0.0,
+        graph=jnp.asarray([[0, 1], [0, 0]]), include_new_tasks=False,
+        oracle_achievement_ids=(0, 1), allow_completed_goals=allow_completed,
+    )
+    goal = GoalState(
+        objective=jnp.asarray([0]), completed=jnp.asarray([[True, False]]),
+        last_completed=jnp.asarray([1]),
+    )
+    novel = jnp.zeros((1, 22), bool).at[0, 1].set(True)
+    events = novel.at[0, 0].set(True)
+    result = advance_goal_progress(
+        runtime, goal, jnp.zeros((1, 1)), jnp.asarray([0]),
+        jnp.zeros((1, 1)), jnp.asarray([False]), jnp.asarray([1.0]),
+        new_achievements=novel, achievement_events=events,
+    )
+    state, reward, success = result[:3]
+    assert bool(success[0]) == allow_completed
+    assert reward[0] == 1.0
+    np.testing.assert_array_equal(state.completed, [[True, True]])
+    assert state.last_completed[0] == (0 if allow_completed else 1)
+
+
+@pytest.mark.parametrize("new_target", [False, True])
+def test_target_bonus_is_first_achievement_only_even_when_success_repeats(new_target):
+    reward = shape_goal_reward(
+        _runtime(), goal_done=jnp.asarray([True]),
+        achievement_reward=jnp.asarray([float(new_target)]),
+        target_is_new=jnp.asarray([new_target]), health_reward=jnp.asarray([0.2]),
+    )
+    np.testing.assert_allclose(reward, [5.2 if new_target else 0.2])
+
+
+def test_repeated_oracle_target_ends_option_with_zero_achievement_reward():
+    runtime = GoalRuntime(
+        transition_network=None, transition_params=None,
+        centroids=jnp.zeros((2, 1)), threshold=0.0,
+        graph=jnp.zeros((2, 2)), include_new_tasks=False,
+        oracle_achievement_ids=(0, 1), allow_completed_goals=True,
+    )
+    goal = GoalState(jnp.asarray([0]), jnp.asarray([[True, False]]), jnp.asarray([1]))
+    result = advance_goal_progress(
+        runtime, goal, jnp.zeros((1, 1)), jnp.asarray([0]), jnp.zeros((1, 1)),
+        jnp.asarray([False]), jnp.asarray([0.0]),
+        new_achievements=jnp.zeros((1, 22), bool),
+        achievement_events=jnp.zeros((1, 22), bool).at[0, 0].set(True),
+    )
+    assert result[2][0]
+    assert result[1][0] == 0.0
 
 
 def test_load_oracle_graph_validates_mapping(tmp_path):

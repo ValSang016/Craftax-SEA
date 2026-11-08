@@ -47,6 +47,13 @@ def test_training_cli_defaults_to_pixels():
     assert defaults.high_level_q_replay_ratio == 4.0
     assert defaults.high_level_min_replay_size == 1024
     assert defaults.high_level_goal_timeout == 300
+    assert defaults.allow_unready_goals is False
+    assert defaults.allow_completed_goals is False
+    eligibility = parser.parse_args([
+        "--allow-unready-goals", "True", "--allow-completed-goals", "true",
+    ])
+    assert eligibility.allow_unready_goals is True
+    assert eligibility.allow_completed_goals is True
     assert parser.parse_args(["--symbolic-debug"]).pixels is False
     assert parser.parse_args(["--symbolic"]).pixels is False
     assert parser.parse_args(["--graph-path", "graph.npz"]).oracle_graph == "graph.npz"

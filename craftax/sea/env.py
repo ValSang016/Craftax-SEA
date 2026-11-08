@@ -118,12 +118,14 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         health_reward_coef: float = 0.0,
         combat_damage_mode: str = "lethal-only",
         static_env_params=None,
+        track_achievement_events: bool = False,
     ):
         super().__init__()
         self.symbolic = symbolic
         self.idle_timeout = int(idle_timeout)
         self.immortal = bool(immortal)
         self.health_reward_coef = float(health_reward_coef)
+        self.track_achievement_events = bool(track_achievement_events)
         if combat_damage_mode not in {"lethal-only", "cumulative"}:
             raise ValueError(
                 "combat_damage_mode must be 'lethal-only' or 'cumulative'"
@@ -150,8 +152,15 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         params: EnvParams,
     ) -> Tuple[jax.Array, SeaEnvState, float, bool, dict]:
         old_state = state.env_state
+        # Game logic uses achievement bits only for bookkeeping and reward.
+        # Starting those bits empty exposes this step's actual events, including
+        # repeats. Restore cumulative bits before observation/score/reward.
+        step_input = (
+            old_state.replace(achievements=jnp.zeros_like(old_state.achievements))
+            if self.track_achievement_events else old_state
+        )
         stepped_state, _ = craftax_step(
-            key, old_state, action, params, self.static_env_params
+            key, step_input, action, params, self.static_env_params
         )
 
         if self.combat_damage_mode == "lethal-only":
@@ -162,12 +171,20 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         # before rendering so neither symbolic nor pixel observations expose a
         # transient death state.
         if self.immortal:
-            stepped_state = _restore_immortal_player(old_state, stepped_state)
+            stepped_state = _restore_immortal_player(step_input, stepped_state)
+
+        achievement_events = stepped_state.achievements
+        if self.track_achievement_events:
+            stepped_state = stepped_state.replace(
+                achievements=old_state.achievements | achievement_events
+            )
 
         health_delta = (
             stepped_state.player_health - old_state.player_health
         ).astype(jnp.float32)
         new_achievements = stepped_state.achievements & ~old_state.achievements
+        if not self.track_achievement_events:
+            achievement_events = new_achievements
         event_count = new_achievements.astype(jnp.float32).sum()
         event_happened = new_achievements.any()
         idle_steps = jnp.where(event_happened, 0, state.idle_steps + 1)
@@ -190,6 +207,7 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
                 "event_count": event_count,
                 "event_happened": event_happened,
                 "new_achievements": new_achievements,
+                "achievement_events": achievement_events,
                 # The vector wrapper resets immediately after this call.  Keep
                 # terminal episode state in info so PPO can aggregate the same
                 # per-episode metrics as SEA's CrafterMonitorWrapper.
@@ -254,6 +272,7 @@ def make_sea_craftax_classic_env(
     immortal: bool = True,
     health_reward_coef: float = 0.0,
     combat_damage_mode: str = "lethal-only",
+    track_achievement_events: bool = False,
 ) -> SeaCraftaxClassicEnvNoAutoReset:
     return SeaCraftaxClassicEnvNoAutoReset(
         symbolic=symbolic,
@@ -261,6 +280,7 @@ def make_sea_craftax_classic_env(
         immortal=immortal,
         health_reward_coef=health_reward_coef,
         combat_damage_mode=combat_damage_mode,
+        track_achievement_events=track_achievement_events,
     )
 
 

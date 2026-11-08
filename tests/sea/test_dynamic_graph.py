@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from craftax.sea.dynamic_graph import (
     HighLevelReplayBuffer,
@@ -10,10 +11,12 @@ from craftax.sea.dynamic_graph import (
     compute_q_update_count,
     compute_smdp_target,
     get_ready_goal_candidates,
+    get_goal_candidates,
     high_level_option_done,
     initialize_high_level_q,
     split_symbolic_state,
     stable_masked_softmax,
+    update_high_level_q,
 )
 
 
@@ -57,6 +60,37 @@ def test_candidates_include_only_unfinished_ready_nodes_and_unknown():
         jnp.asarray([[True, False, False, False]]), graph, True
     )
     np.testing.assert_array_equal(after_root, [[False, True, True, True]])
+
+
+@pytest.mark.parametrize(
+    "allow_unready,allow_completed,expected",
+    [
+        (False, False, [False, True, False]),
+        (False, True, [True, True, False]),
+        (True, False, [False, True, True]),
+        (True, True, [True, True, True]),
+    ],
+)
+def test_goal_eligibility_options_are_independent(allow_unready, allow_completed, expected):
+    graph = jnp.asarray([[0, 1, 0], [0, 0, 1], [0, 0, 0]], dtype=jnp.int8)
+    mask = get_goal_candidates(
+        jnp.asarray([[True, False, False]]), graph, False,
+        allow_unready_goals=allow_unready,
+        allow_completed_goals=allow_completed,
+    )
+    np.testing.assert_array_equal(mask, [expected])
+
+
+@pytest.mark.parametrize("allow_completed", [False, True])
+def test_warmup_excludes_unready_even_when_allowed_afterwards(allow_completed):
+    graph = jnp.asarray([[0, 1, 0], [0, 0, 1], [0, 0, 0]], dtype=jnp.int8)
+    completed = jnp.asarray([[True, False, False]])
+    evaluate = jax.jit(lambda warmup: get_goal_candidates(
+        completed, graph, False, allow_unready_goals=True,
+        allow_completed_goals=allow_completed, warmup=warmup,
+    ))
+    np.testing.assert_array_equal(evaluate(True), [[allow_completed, True, False]])
+    np.testing.assert_array_equal(evaluate(False), [[allow_completed, True, True]])
 
 
 def test_dynamic_score_is_static_edge_plus_weighted_residual():
@@ -115,6 +149,35 @@ def test_base_q_target_stops_gradient_to_full_q():
     full = jnp.asarray([3.0, 4.0])
     full_gradient = jax.grad(base_q_regression_loss, argnums=1)(base, full)
     np.testing.assert_array_equal(full_gradient, jnp.zeros_like(full))
+
+
+@pytest.mark.parametrize(
+    "allow_unready,allow_completed,warmup,expected_loss",
+    [(False, False, False, 1.0), (True, False, False, 400.0),
+     (True, False, True, 1.0), (False, True, False, 10000.0)],
+)
+def test_q_bootstrap_uses_the_configured_goal_eligibility(
+    allow_unready, allow_completed, warmup, expected_loss,
+):
+    obs = jnp.zeros((1, 1345))
+    completed = jnp.asarray([[True, False, False]])
+    node = jnp.asarray([0])
+    q = initialize_high_level_q(jax.random.PRNGKey(44), obs, completed, node, 3, 8, 1e-3)
+    zeros = jax.tree.map(jnp.zeros_like, q.full_q.params)
+    target = jax.tree.map(jnp.zeros_like, q.target_full_params)
+    target["params"]["Dense_2"]["bias"] = jnp.asarray([100.0, 1.0, 20.0])
+    q = q.replace(full_q=q.full_q.replace(params=zeros), target_full_params=target)
+    batch = HighLevelTransitionBatch(
+        obs, completed, node, jnp.asarray([1]), jnp.zeros(1), obs, completed,
+        node, jnp.ones(1, jnp.int32), jnp.zeros(1, bool), jnp.zeros(1, bool),
+    )
+    graph = jnp.asarray([[0, 1, 0], [0, 0, 1], [0, 0, 0]])
+    _, metrics = update_high_level_q(
+        q, batch, graph, False, 1.0,
+        allow_unready_goals=allow_unready, allow_completed_goals=allow_completed,
+        warmup=warmup,
+    )
+    assert metrics["full_q_loss"] == expected_loss
 
 
 def test_full_q_has_internal_state_inputs_and_base_q_does_not():

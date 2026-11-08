@@ -15,6 +15,9 @@ scripts/*.py
 !scripts/visualize_sea_graph.py
 !scripts/replay_sea_policy.py
 !scripts/run_sea_experiments.py
+!scripts/run_goal_candidate_sweep.py
+!scripts/analyze_goal_candidate_sweep.py
+!scripts/evaluate_selector_checkpoints.py
 tests/sea/test_oracle_goal.py
 tests/sea/test_ppo_ff.py
 docs/sea/experiments.json

@@ -196,6 +196,30 @@ def _progress_reporter(output, stage, config, wandb_logger=None):
     return report
 
 
+def _make_dynamic_config(args):
+    if args.pixels or args.high_level_controller != "residual":
+        if args.dynamic_lambda != 1.0 or args.dynamic_score_source != "residual":
+            raise ValueError("dynamic scoring options require --symbolic --high-level-controller residual")
+        return None
+    config = DynamicGraphConfig(
+        warmup_steps=args.dynamic_warmup_steps,
+        residual_weight=args.dynamic_beta,
+        structural_prior_weight=args.dynamic_lambda,
+        score_source=args.dynamic_score_source,
+        temperature=args.dynamic_temperature,
+        replay_capacity=args.high_level_replay_capacity,
+        batch_size=args.high_level_q_batch_size,
+        learning_rate=args.high_level_q_learning_rate,
+        high_level_q_replay_ratio=args.high_level_q_replay_ratio,
+        min_replay_size=args.high_level_min_replay_size,
+        goal_timeout=args.high_level_goal_timeout,
+        allow_unready_goals=args.allow_unready_goals,
+        allow_completed_goals=args.allow_completed_goals,
+    )
+    config.validate()
+    return config
+
+
 def run_pipeline(args):
     train_policy = make_train
     collect_stream = iter_policy_transitions
@@ -212,6 +236,12 @@ def run_pipeline(args):
     oracle_graph = (
         load_oracle_graph(oracle_source) if oracle_source is not None else None
     )
+    if args.allow_unready_goals or args.allow_completed_goals:
+        if args.pixels or args.high_level_controller != "residual":
+            raise ValueError("goal eligibility options require --symbolic --high-level-controller residual")
+    if args.allow_completed_goals and oracle_graph is None:
+        raise ValueError("--allow-completed-goals true requires an achievement-indexed --graph-path")
+    dynamic_config = _make_dynamic_config(args)
     if args.discovery_interactions <= 0:
         raise ValueError("--discovery-interactions must be positive")
     if args.contrast_interactions < 0:
@@ -244,6 +274,7 @@ def run_pipeline(args):
         immortal=args.immortal,
         health_reward_coef=args.health_reward_coef,
         combat_damage_mode=args.combat_damage_mode,
+        track_achievement_events=args.allow_completed_goals,
     )
     common_ppo = dict(
         num_envs=args.num_envs,
@@ -280,20 +311,6 @@ def run_pipeline(args):
         max_grad_norm=args.discovery_max_grad_norm,
     )
     goal_config = PPOConfig(total_timesteps=args.goal_timesteps, **common_ppo)
-    dynamic_config = None
-    if symbolic and args.high_level_controller == "residual":
-        dynamic_config = DynamicGraphConfig(
-            warmup_steps=args.dynamic_warmup_steps,
-            residual_weight=args.dynamic_beta,
-            temperature=args.dynamic_temperature,
-            replay_capacity=args.high_level_replay_capacity,
-            batch_size=args.high_level_q_batch_size,
-            learning_rate=args.high_level_q_learning_rate,
-            high_level_q_replay_ratio=args.high_level_q_replay_ratio,
-            min_replay_size=args.high_level_min_replay_size,
-            goal_timeout=args.high_level_goal_timeout,
-        )
-        dynamic_config.validate()
     run_config = {
         "args": vars(args),
         "base_ppo": asdict(base_config),
@@ -305,6 +322,7 @@ def run_pipeline(args):
             None if dynamic_config is None else asdict(dynamic_config)
         ),
         "oracle_direct": oracle_graph is not None,
+        "achievement_reward_policy": "episode-first-occurrence-only",
     }
     (output / "config.json").write_text(
         json.dumps(run_config, indent=2), encoding="utf-8"
@@ -332,6 +350,7 @@ def run_pipeline(args):
             ),
             include_new_tasks=not args.no_new_tasks,
             oracle_achievement_ids=oracle_graph.achievement_ids,
+            allow_completed_goals=args.allow_completed_goals,
         )
         print(
             "[5/5] training oracle-graph-conditioned PPO-RNN; "
@@ -696,15 +715,42 @@ def build_parser():
         choices=("residual", "sea-meta-controller"),
         default="residual",
         help=(
-            "symbolic high-level goal selector: state-conditioned Q residual "
+            "symbolic high-level goal selector: configurable Q scoring "
             "(default) or SEA's original graph meta-controller"
         ),
     )
     parser.add_argument(
         "--dynamic-warmup-steps", type=int, default=30_000_000
     )
-    parser.add_argument("--dynamic-beta", "--beta", type=float, default=1.0)
+    parser.add_argument(
+        "--dynamic-beta", "--beta", type=float, default=1.0,
+        help="beta multiplying the selected Q signal: residual, base-q, or full-q (default: 1)",
+    )
+    parser.add_argument(
+        "--dynamic-lambda", type=float, default=1.0,
+        help="non-negative structural prior weight lambda in lambda*A + beta*signal (default: 1)",
+    )
+    parser.add_argument(
+        "--dynamic-score-source", choices=("residual", "base-q", "full-q"), default="residual",
+        help="selection signal: residual=Q_F-Q_B (default), base-q=Q_B, full-q=Q_F; Q learning is unchanged",
+    )
     parser.add_argument("--dynamic-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--allow-unready-goals", type=_parse_bool, default=False, metavar="BOOL",
+        help=(
+            "true: allow goals with unmet graph prerequisites after warmup; "
+            "false: require prerequisites (default). Warmup always excludes unready goals."
+        ),
+    )
+    parser.add_argument(
+        "--allow-completed-goals", type=_parse_bool, default=False, metavar="BOOL",
+        help=(
+            "true: allow goals achieved earlier in the current episode and recognize repeated "
+            "achievement events as target successes; false: exclude completed goals (default). "
+            "Achievement rewards are first-occurrence-only; repeated success only ends the option. "
+            "Requires a symbolic residual controller and an achievement-indexed oracle graph."
+        ),
+    )
     parser.add_argument(
         "--high-level-replay-capacity", type=int, default=100_000
     )

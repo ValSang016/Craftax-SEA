@@ -13,8 +13,9 @@ oracle_graph="${ORACLE_GRAPH:-$repo_root/artifacts/oracle_graphs/craftax_classic
 run_root="${RUN_ROOT:-$repo_root/runs/oracle-residual}"
 lock_root="${GPU_LOCK_ROOT:-/tmp/craftax-oracle-residual-gpu-locks}"
 seed_root="$run_root/seed-$seed"
-betas=(1.0 0.8 0.5 0.2)
-gpus=(0 1 2 3)
+# Space-separated overrides allow a sweep to stay on a dedicated physical GPU.
+read -r -a betas <<< "${BETAS:-1.0 0.8 0.5 0.2}"
+read -r -a gpus <<< "${GPUS:-0 1 2 3}"
 
 if [[ ! -f "$oracle_graph" ]]; then
   echo "Missing oracle graph: $oracle_graph" >&2
@@ -88,6 +89,7 @@ for beta in "${betas[@]}"; do
     --dynamic-beta "$beta"
     --wandb-entity zaezae01
     --wandb-project craftax-dynamic-graph
+    --wandb-mode "${WANDB_MODE:-online}"
     --wandb-name "$wandb_name"
     --wandb-group "$wandb_group"
     --output "$output"

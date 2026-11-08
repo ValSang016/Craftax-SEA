@@ -33,6 +33,30 @@ def _saved_or_default(saved_args, name, default):
     return default if value is None else value
 
 
+def _resolve_dynamic_config(source_config, args, pixel):
+    scoring_arguments = ("dynamic_beta", "dynamic_lambda", "dynamic_score_source")
+    if pixel:
+        if any(getattr(args, name) is not None for name in scoring_arguments):
+            raise ValueError("dynamic scoring options require a symbolic source run")
+        return None
+    config = DynamicGraphConfig(**(source_config.get("dynamic_graph") or {}))
+    overrides = {
+        name: getattr(args, name)
+        for name in ("allow_unready_goals", "allow_completed_goals")
+        if getattr(args, name) is not None
+    }
+    for argument, field in (
+        ("dynamic_beta", "residual_weight"),
+        ("dynamic_lambda", "structural_prior_weight"),
+        ("dynamic_score_source", "score_source"),
+    ):
+        if getattr(args, argument) is not None:
+            overrides[field] = getattr(args, argument)
+    config = replace(config, **overrides)
+    config.validate()
+    return config
+
+
 def run(args):
     source = Path(args.source).expanduser().resolve()
     output = Path(args.output).expanduser()
@@ -93,12 +117,9 @@ def run(args):
     goal_config = PPOConfig(**source_config["goal_ppo"])
     if args.goal_timesteps is not None:
         goal_config = replace(goal_config, total_timesteps=args.goal_timesteps)
-    dynamic_config = None
-    if not pixel:
-        dynamic_config = DynamicGraphConfig(
-            **(source_config.get("dynamic_graph") or {})
-        )
-        dynamic_config.validate()
+    dynamic_config = _resolve_dynamic_config(source_config, args, pixel)
+    if dynamic_config is not None and dynamic_config.allow_completed_goals and oracle_graph is None:
+        raise ValueError("repeated goal successes require an achievement-indexed oracle graph")
 
     discovery = source_config["discovery"]
     encoder = TransitionEncoder(
@@ -138,6 +159,11 @@ def run(args):
             "combat_damage_mode": combat_damage_mode,
             "goal_timesteps": goal_config.total_timesteps,
             "goal_only_from": str(source),
+            "allow_unready_goals": bool(dynamic_config and dynamic_config.allow_unready_goals),
+            "allow_completed_goals": bool(dynamic_config and dynamic_config.allow_completed_goals),
+            "dynamic_beta": dynamic_config.residual_weight if dynamic_config else None,
+            "dynamic_lambda": dynamic_config.structural_prior_weight if dynamic_config else None,
+            "dynamic_score_source": dynamic_config.score_source if dynamic_config else None,
             "oracle_graph": "oracle_graph.npz" if oracle_graph is not None else None,
             "no_new_tasks": no_new_tasks,
             "goal_success_coefficient": goal_success_coefficient,
@@ -147,6 +173,7 @@ def run(args):
         }
     )
     run_config["goal_ppo"] = vars(goal_config)
+    run_config["achievement_reward_policy"] = "episode-first-occurrence-only"
     run_config["dynamic_graph"] = (
         None if dynamic_config is None else vars(dynamic_config)
     )
@@ -162,6 +189,7 @@ def run(args):
         immortal=immortal,
         health_reward_coef=health_coef,
         combat_damage_mode=combat_damage_mode,
+        track_achievement_events=bool(dynamic_config and dynamic_config.allow_completed_goals),
     )
     runtime = GoalRuntime(
         transition_network=encoder,
@@ -186,6 +214,7 @@ def run(args):
         oracle_achievement_ids=(
             None if oracle_graph is None else oracle_graph.achievement_ids
         ),
+        allow_completed_goals=bool(dynamic_config and dynamic_config.allow_completed_goals),
     )
 
     print(
@@ -236,6 +265,20 @@ def build_parser():
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--goal-timesteps", type=int)
+    parser.add_argument("--dynamic-beta", "--beta", type=float, default=None,
+                        help="beta multiplying the selected Q signal; default: inherit source")
+    parser.add_argument("--dynamic-lambda", type=float, default=None,
+                        help="structural prior weight lambda; default: inherit source (legacy: 1)")
+    parser.add_argument("--dynamic-score-source", choices=("residual", "base-q", "full-q"), default=None,
+                        help="selection signal; default: inherit source (legacy: residual)")
+    parser.add_argument(
+        "--allow-unready-goals", type=_parse_bool, default=None, metavar="BOOL",
+        help="allow unmet prerequisites after warmup; default: inherit source setting",
+    )
+    parser.add_argument(
+        "--allow-completed-goals", type=_parse_bool, default=None, metavar="BOOL",
+        help="allow completed oracle goals and repeated target successes; default: inherit source setting",
+    )
     parser.add_argument(
         "--goal-success-coefficient",
         type=float,

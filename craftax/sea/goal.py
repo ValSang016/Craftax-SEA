@@ -35,6 +35,7 @@ class GoalRuntime:
     include_new_tasks: bool = True
     reset_rnn_on_goal: bool = True
     oracle_achievement_ids: tuple[int, ...] | None = None
+    allow_completed_goals: bool = False
     def __post_init__(self):
         coefficients = [self.goal_success_coefficient]
         if self.non_target_achievement_coefficient is not None:
@@ -136,22 +137,26 @@ def classify_embeddings(embeddings, centroids, threshold):
 
 
 def shape_goal_reward(
-    runtime, goal_done, achievement_reward, health_reward=0.0
+    runtime, goal_done, achievement_reward, health_reward=0.0, target_is_new=None
 ):
-    """Add target, non-target achievement, and signed health rewards."""
+    """Reward novel achievements; repeated successes may still end an option."""
 
     goal_value = goal_done.astype(jnp.float32)
+    rewarded_target = (
+        goal_value if target_is_new is None
+        else goal_value * target_is_new.astype(jnp.float32)
+    )
     if runtime.non_target_achievement_coefficient is None:
         achievement_value = (
             runtime.exploration_reward_coefficient * achievement_reward
         )
     else:
-        non_target_count = jnp.maximum(achievement_reward - goal_value, 0.0)
+        non_target_count = jnp.maximum(achievement_reward - rewarded_target, 0.0)
         achievement_value = (
             runtime.non_target_achievement_coefficient * non_target_count
         )
     return (
-        runtime.goal_success_coefficient * goal_value
+        runtime.goal_success_coefficient * rewarded_target
         + achievement_value
         + health_reward
     )
@@ -219,20 +224,26 @@ def advance_goal_progress(
     event_count,
     new_achievements=None,
     health_reward=0.0,
+    achievement_events=None,
 ):
     """Classify an event and update progress without selecting another goal."""
 
     if runtime.oracle_achievement_ids is not None:
         if new_achievements is None:
             raise ValueError("Oracle runtime requires new_achievements")
-        known = new_achievements[:, jnp.asarray(runtime.oracle_achievement_ids)]
-        unknown = new_achievements.sum(-1) > known.sum(-1)
+        observed = (
+            achievement_events
+            if runtime.allow_completed_goals and achievement_events is not None
+            else new_achievements
+        )
+        known = observed[:, jnp.asarray(runtime.oracle_achievement_ids)]
+        unknown = observed.sum(-1) > known.sum(-1)
         events = (
             jnp.concatenate([known, unknown[:, None]], axis=-1)
             if runtime.include_new_tasks
             else known
         )
-        event_happened = new_achievements.any(-1)
+        event_happened = observed.any(-1)
         goal_done = jnp.take_along_axis(events, goal_state.objective[:, None], axis=1)[:, 0]
         # For simultaneous events, prefer the achieved objective as last event;
         # otherwise use the first known event, or unknown if no known event.
@@ -244,8 +255,18 @@ def advance_goal_progress(
             if runtime.include_new_tasks
             else events
         )
+        novel_known = new_achievements[:, jnp.asarray(runtime.oracle_achievement_ids)]
+        novel_unknown = new_achievements.sum(-1) > novel_known.sum(-1)
+        novel_events = (
+            jnp.concatenate([novel_known, novel_unknown[:, None]], axis=-1)
+            if runtime.include_new_tasks else novel_known
+        )
+        target_is_new = jnp.take_along_axis(
+            novel_events, goal_state.objective[:, None], axis=1
+        )[:, 0]
         shaped_reward = shape_goal_reward(
-            runtime, goal_done, event_count, health_reward
+            runtime, goal_done, event_count, health_reward,
+            target_is_new=target_is_new,
         )
     else:
         _, embeddings = runtime.transition_network.apply(
