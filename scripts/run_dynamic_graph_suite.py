@@ -188,6 +188,8 @@ def main():
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
                         default="online")
+    parser.add_argument("--label", default="",
+                        help="suffix for manifest/status/supervisor files when several supervisors share --output")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.jobs_per_gpu < 1:
@@ -219,7 +221,7 @@ def main():
                 sys.exit(f"GPU {gpu} is not usable by JAX (backend={backend[0]}):\n{check.stderr[-2000:]}")
 
     root.mkdir(parents=True, exist_ok=True)
-    write_json(root / "manifest.json", {
+    write_json(root / f"manifest{args.label}.json", {
         "created": datetime.now().isoformat(timespec="seconds"),
         "git_revision": git_revision(),
         "argv": sys.argv,
@@ -251,7 +253,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     def status():
-        write_json(root / "status.json", {
+        write_json(root / f"status{args.label}.json", {
             "updated": datetime.now().isoformat(timespec="seconds"),
             "supervisor_pid": os.getpid(),
             "jobs": [
