@@ -147,8 +147,15 @@ def make_train(
     dynamic_config=None,
     progress_callback=None,
     progress_interval: int = 50,
+    frozen_params=None,
 ):
-    """Build a jittable base or joint goal-policy training function."""
+    """Build a jittable base or joint goal-policy training function.
+
+    ``frozen_params`` (``{"policy": ..., "option_model": ...,
+    "option_model_target": ...}``) turns the function into a frozen
+    evaluation: the same rollout and goal-selection code runs, but neither
+    PPO nor the graph model is updated.
+    """
 
     config.validate()
     if progress_interval < 1:
@@ -201,6 +208,8 @@ def make_train(
             optax.clip_by_global_norm(config.max_grad_norm),
             optax.adam(learning_rate, eps=1e-5),
         )
+        if frozen_params is not None:
+            network_params = frozen_params["policy"]
         train_state = TrainState.create(
             apply_fn=network.apply, params=network_params, tx=optimizer
         )
@@ -303,6 +312,13 @@ def make_train(
                     q_key, observation, completed, current_node,
                     num_objectives, dynamic_config,
                 )
+                if frozen_params is not None:
+                    q_state = q_state.replace(
+                        train_state=q_state.train_state.replace(
+                            params=frozen_params["option_model"]
+                        ),
+                        target_params=frozen_params["option_model_target"],
+                    )
                 if dynamic_config.warmup_steps > 0:
                     objective = choose_meta_controller_goals(
                         goal_key, completed, current_node
@@ -670,8 +686,8 @@ def make_train(
                     dynamic_config.high_level_q_replay_ratio,
                 )
                 q_update_count = jnp.where(
-                    dynamic_state.replay.size
-                    >= dynamic_config.min_replay_size,
+                    (dynamic_state.replay.size >= dynamic_config.min_replay_size)
+                    & (frozen_params is None),
                     requested_q_updates,
                     0,
                 ).astype(jnp.int32)
@@ -826,12 +842,18 @@ def make_train(
                 )
                 return (train_state, key), losses
 
-            (train_state, key), losses = jax.lax.scan(
-                epoch,
-                (train_state, key),
-                None,
-                length=config.update_epochs,
-            )
+            if frozen_params is None:
+                (train_state, key), losses = jax.lax.scan(
+                    epoch,
+                    (train_state, key),
+                    None,
+                    length=config.update_epochs,
+                )
+            else:
+                zeros = jnp.zeros(
+                    (config.update_epochs, config.num_minibatches), jnp.float32
+                )
+                losses = (zeros, (zeros, zeros, zeros), zeros)
             runner_state = (
                 train_state,
                 env_state,

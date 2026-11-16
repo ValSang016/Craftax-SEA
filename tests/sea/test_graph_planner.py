@@ -281,3 +281,44 @@ def test_planner_prune_option_reaches_config():
     ])
     config = _make_dynamic_config(args)
     assert config.planner_prune == "all" and config.planner_prune_width == 13
+
+
+def test_frozen_mode_rolls_out_without_changing_any_weights():
+    from craftax.sea.env import make_sea_craftax_classic_env
+    from craftax.sea.goal import GoalRuntime, load_oracle_graph
+    from craftax.sea.ppo_rnn import PPOConfig, make_train
+
+    oracle = load_oracle_graph("artifacts/oracle_graphs/craftax_classic_22.npz")
+    config = PPOConfig(total_timesteps=8 * 8 * 3, num_envs=8, num_steps=8,
+                       update_epochs=1, num_minibatches=2, hidden_size=32, reset_ratio=2)
+    runtime = GoalRuntime(
+        None, None, jnp.zeros((22, 1)), 0.0, jnp.asarray(oracle.graph),
+        include_new_tasks=False, oracle_achievement_ids=oracle.achievement_ids,
+        allow_completed_goals=True,
+    )
+    env = make_sea_craftax_classic_env(symbolic=True, idle_timeout=10000, immortal=False,
+                                       track_achievement_events=True)
+    dynamic = DynamicGraphConfig(
+        controller="graph-planner", warmup_steps=0, replay_capacity=8, batch_size=8,
+        min_replay_size=8, allow_completed_goals=True, allow_unready_goals=True,
+        model_hidden_size=16, model_latent_size=8,
+    )
+    trained = jax.jit(make_train(config, env, goal_runtime=runtime,
+                                 dynamic_config=dynamic))(jax.random.PRNGKey(0))
+    frozen = {
+        "policy": trained["runner_state"][0].params,
+        "option_model": trained["runner_state"][7].q_state.train_state.params,
+        "option_model_target": trained["runner_state"][7].q_state.target_params,
+    }
+    result = jax.jit(make_train(config, env, goal_runtime=runtime, dynamic_config=dynamic,
+                                frozen_params=frozen))(jax.random.PRNGKey(84001))
+    after = result["runner_state"]
+    for before, now in (
+        (frozen["policy"], after[0].params),
+        (frozen["option_model"], after[7].q_state.train_state.params),
+        (frozen["option_model_target"], after[7].q_state.target_params),
+    ):
+        assert all(jax.tree.leaves(jax.tree.map(lambda a, b: bool(jnp.array_equal(a, b)),
+                                                before, now)))
+    assert int(result["metrics"]["high_level_q_update_count"].sum()) == 0
+    assert float(result["metrics"]["uniform_selection_fraction"].sum()) == 0.0
