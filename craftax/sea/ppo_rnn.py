@@ -93,6 +93,7 @@ class DynamicStepMetrics(NamedTuple):
     uniform_selection: jax.Array
     planner_overflow: jax.Array
     selected_new: jax.Array
+    recorded: jax.Array
 
 
 @struct.dataclass
@@ -582,6 +583,7 @@ def make_train(
                         ),
                         planner_overflow=overflow & option_done,
                         selected_new=selected_new,
+                        recorded=replay_valid,
                     )
                 next_reset = (
                     bootstrap_done
@@ -656,7 +658,9 @@ def make_train(
             q_metrics = None
             q_update_count = None
             if dynamic_config is not None:
-                new_transition_count = dynamic_rollout.ended.astype(
+                # Replay ratio counts transitions actually written to replay
+                # (warmup drops censored options), not every option ending.
+                new_transition_count = dynamic_rollout.recorded.astype(
                     jnp.int32
                 ).sum()
                 requested_q_updates = compute_q_update_count(
@@ -870,6 +874,9 @@ def make_train(
                     {
                         "high_level_replay_size": dynamic_state.replay.size,
                         "high_level_transition_count": transition_count,
+                        "high_level_recorded_count": (
+                            dynamic_rollout.recorded.astype(jnp.float32).sum()
+                        ),
                         "high_level_q_update_count": q_update_count,
                         "selected_goal_distribution": (
                             selected_counts / denominator
