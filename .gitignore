@@ -192,3 +192,7 @@ cython_debug/
 .idea/
 texture_cache.pbz2
 texture_cache*.pbz2
+
+docs/
+scripts/run_goal_candidate_sweep.py
+tests/
