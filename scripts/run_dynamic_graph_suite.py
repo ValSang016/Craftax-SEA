@@ -36,11 +36,37 @@ DEFAULT_GRAPH = REPO / "artifacts/oracle_graphs/craftax_classic_22.npz"
 COMMON = [
     "--symbolic",
     "--no-new-tasks",
-    "--immortal", "true",
+    "--immortal", "false",
     "--idle-timeout", "10000",
     "--combat-damage-mode", "cumulative",
     "--high-level-goal-timeout", "300",
 ]
+
+
+def parse_condition(token):
+    """``sea`` or ``K<h>-<leaf|noleaf>-r<repeat coefficient>`` (e.g. K2-noleaf-r1)."""
+    if token == "sea":
+        return {"kind": "sea"}
+    try:
+        horizon, leaf, repeat = token.split("-")
+        assert horizon[0] == "K" and leaf in ("leaf", "noleaf") and repeat[0] == "r"
+        return {"kind": "planner", "horizon": int(horizon[1:]),
+                "leaf": leaf == "leaf", "repeat": float(repeat[1:])}
+    except (ValueError, AssertionError, IndexError):
+        raise argparse.ArgumentTypeError(
+            f"bad condition {token!r}; use 'sea' or e.g. 'K2-noleaf-r1'"
+        ) from None
+
+
+def default_conditions(args):
+    conditions = [parse_condition("sea")]
+    for horizon in args.horizons:
+        for leaf in args.leaf:
+            label = "leaf" if leaf else "noleaf"
+            conditions.append(parse_condition(
+                f"K{horizon}-{label}-r{args.repeat_target_coefficient:g}"
+            ))
+    return conditions
 
 
 def build_jobs(args):
@@ -53,31 +79,33 @@ def build_jobs(args):
             "tags": tags,
         }
 
+    conditions = args.conditions or default_conditions(args)
     jobs = []
-    for index, horizon in enumerate(args.horizons):
-        if index == 0:
-            for seed in args.seeds:
+    for condition in conditions:
+        for seed in args.seeds:
+            if condition["kind"] == "sea":
                 jobs.append(job(
                     "exp1-sea-meta", seed,
                     ["--high-level-controller", "sea-meta-controller"],
                     ["exp1", "sea-meta"],
                 ))
-        for leaf in args.leaf:
-            label = "leaf" if leaf else "noleaf"
-            for seed in args.seeds:
-                jobs.append(job(
-                    f"exp2-K{horizon}-{label}", seed,
-                    [
-                        "--high-level-controller", "graph-planner",
-                        "--dynamic-warmup-steps", str(args.warmup_steps),
-                        "--allow-completed-goals", "true",
-                        "--allow-unready-goals", "true",
-                        "--planner-horizon", str(horizon),
-                        "--planner-leaf", str(leaf).lower(),
-                        "--high-level-q-learning-rate", str(args.model_learning_rate),
-                    ],
-                    ["exp2", f"K{horizon}", label],
-                ))
+                continue
+            horizon, repeat = condition["horizon"], condition["repeat"]
+            label = "leaf" if condition["leaf"] else "noleaf"
+            jobs.append(job(
+                f"exp2-K{horizon}-{label}-r{repeat:g}", seed,
+                [
+                    "--high-level-controller", "graph-planner",
+                    "--dynamic-warmup-steps", str(args.warmup_steps),
+                    "--allow-completed-goals", "true",
+                    "--repeat-target-coefficient", str(repeat),
+                    "--allow-unready-goals", "true",
+                    "--planner-horizon", str(horizon),
+                    "--planner-leaf", str(condition["leaf"]).lower(),
+                    "--high-level-q-learning-rate", str(args.model_learning_rate),
+                ],
+                ["exp2", f"K{horizon}", label, f"repeat{repeat:g}"],
+            ))
     if args.order == "seed":
         # Every condition's seed 0 first, then seed 1, then seed 2.
         jobs.sort(key=lambda item: args.seeds.index(item["seed"]))
@@ -91,6 +119,7 @@ def command(args, job, output):
         "--graph-path", str(args.graph),
         "--goal-timesteps", str(args.goal_timesteps),
         "--seed", str(job["seed"]),
+        "--goal-success-coefficient", str(args.goal_success_coefficient),
         "--log-interval", str(args.log_interval),
         "--output", str(output),
         *job["args"],
@@ -142,6 +171,12 @@ def main():
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--warmup-steps", type=int, default=50_000_000)
     parser.add_argument("--model-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--repeat-target-coefficient", type=float, default=0.0,
+                        help="repeat reward used by the default K x leaf grid")
+    parser.add_argument("--goal-success-coefficient", type=float, default=3.0,
+                        help="first-time target reward for every run (SEA original: 5)")
+    parser.add_argument("--conditions", nargs="+", type=parse_condition,
+                        help="explicit conditions instead of the grid, e.g. sea K2-leaf-r0 K2-noleaf-r1"),
     parser.add_argument("--graph", type=Path, default=DEFAULT_GRAPH)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--python", default=sys.executable)

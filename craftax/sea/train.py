@@ -399,6 +399,7 @@ def run_pipeline(args):
             include_new_tasks=not args.no_new_tasks,
             oracle_achievement_ids=oracle_graph.achievement_ids,
             allow_completed_goals=args.allow_completed_goals,
+            repeat_target_coefficient=args.repeat_target_coefficient,
         )
         print(
             "[5/5] training oracle-graph-conditioned PPO-RNN; "
@@ -739,6 +740,13 @@ def build_parser():
         type=float,
         default=1.0,
         help="SEA non-target achievement reward scale; default: 1",
+    )
+    parser.add_argument(
+        "--repeat-target-coefficient",
+        type=float,
+        default=0.0,
+        help="reward for re-achieving the commanded goal within an episode "
+        "(needs --allow-completed-goals true); default: 0",
     )
     parser.add_argument("--no-new-tasks", action="store_true")
     parser.add_argument(

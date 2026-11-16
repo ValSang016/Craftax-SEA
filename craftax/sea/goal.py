@@ -36,8 +36,11 @@ class GoalRuntime:
     reset_rnn_on_goal: bool = True
     oracle_achievement_ids: tuple[int, ...] | None = None
     allow_completed_goals: bool = False
+    # Reward for achieving the commanded goal again in the same episode.
+    repeat_target_coefficient: float = 0.0
+
     def __post_init__(self):
-        coefficients = [self.goal_success_coefficient]
+        coefficients = [self.goal_success_coefficient, self.repeat_target_coefficient]
         if self.non_target_achievement_coefficient is not None:
             coefficients.append(self.non_target_achievement_coefficient)
         if not np.all(np.isfinite(coefficients)) or any(
@@ -155,8 +158,10 @@ def shape_goal_reward(
         achievement_value = (
             runtime.non_target_achievement_coefficient * non_target_count
         )
+    repeated_target = goal_value - rewarded_target
     return (
         runtime.goal_success_coefficient * rewarded_target
+        + runtime.repeat_target_coefficient * repeated_target
         + achievement_value
         + health_reward
     )
@@ -268,6 +273,14 @@ def advance_goal_progress(
             runtime, goal_done, event_count, health_reward,
             target_is_new=target_is_new,
         )
+        # The "current node" (SEA's last completed node) advances only on a
+        # first-time achievement or a target success, never on an incidental
+        # repeat (e.g. collecting wood again), as in SEA.
+        node_event = novel_known.any(-1) | novel_unknown | goal_done
+        node_class = jnp.where(
+            novel_known.any(-1), jnp.argmax(novel_known, axis=-1), runtime.num_clusters
+        )
+        node_class = jnp.where(goal_done, goal_state.objective, node_class)
     else:
         _, embeddings = runtime.transition_network.apply(
             runtime.transition_params,
@@ -290,9 +303,11 @@ def advance_goal_progress(
             jax.nn.one_hot(predicted_class, runtime.num_objectives, dtype=jnp.bool_)
             & event_happened[:, None]
         )
+        node_event = event_happened
+        node_class = predicted_class
     completed = goal_state.completed | completed_event
     last_completed = jnp.where(
-        event_happened, predicted_class, goal_state.last_completed
+        node_event, node_class, goal_state.last_completed
     )
     transition_completed = completed
     transition_last_completed = last_completed

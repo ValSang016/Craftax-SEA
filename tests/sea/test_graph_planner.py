@@ -140,3 +140,56 @@ def test_cli_builds_graph_planner_config():
     assert config.controller == "graph-planner"
     assert config.planner_horizon == 4 and not config.planner_leaf
     assert replace(config, planner_horizon=2).planner_horizon == 2
+
+
+def _oracle_runtime(repeat=0.0):
+    from craftax.sea.goal import GoalRuntime
+
+    return GoalRuntime(
+        transition_network=None, transition_params=None,
+        centroids=jnp.zeros((3, 1)), threshold=0.0,
+        graph=jnp.zeros((3, 3), dtype=jnp.int8),
+        include_new_tasks=False, oracle_achievement_ids=(0, 1, 2),
+        allow_completed_goals=True, repeat_target_coefficient=repeat,
+    )
+
+
+def _progress(runtime, objective, last, new, events):
+    from craftax.sea.goal import GoalState, advance_goal_progress
+
+    state = GoalState(
+        jnp.array([objective]), jnp.array([[True, True, False]]), jnp.array([last])
+    )
+    padded = lambda x: jnp.zeros((1, 22), dtype=bool).at[0, :3].set(jnp.array(x))
+    return advance_goal_progress(
+        runtime, state, None, None, None, jnp.array([False]),
+        jnp.array([float(sum(new))]),
+        new_achievements=padded(new), achievement_events=padded(events),
+    )
+
+
+def test_incidental_repeat_does_not_move_current_node():
+    result = _progress(_oracle_runtime(), objective=2, last=1,
+                       new=[False] * 3, events=[True, False, False])
+    assert int(result[0].last_completed[0]) == 1
+
+
+def test_commanded_repeat_moves_node_and_gets_repeat_reward():
+    result = _progress(_oracle_runtime(repeat=1.0), objective=0, last=1,
+                       new=[False] * 3, events=[True, False, False])
+    assert int(result[0].last_completed[0]) == 0
+    assert float(result[1][0]) == 1.0
+    first_time = _progress(_oracle_runtime(repeat=1.0), objective=2, last=1,
+                           new=[False, False, True], events=[False, False, True])
+    assert float(first_time[1][0]) == 5.0
+
+
+def test_softmax_is_scale_free():
+    from craftax.sea.graph_planner import sample_from_scores
+
+    keys = jax.random.split(jax.random.PRNGKey(0), 2000)
+    candidates = jnp.ones((22,), dtype=bool)
+    for scale in (0.03, 3.0):
+        scores = jnp.zeros((22,)).at[5].set(scale).at[6].set(0.5 * scale)
+        picks = jax.vmap(lambda k: sample_from_scores(k, scores, candidates, 0.1))(keys)
+        assert float((picks == 5).mean()) > 0.97

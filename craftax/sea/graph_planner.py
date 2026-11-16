@@ -370,7 +370,16 @@ def plan_path_scores(
 
 
 def sample_from_scores(key, scores, candidates, temperature):
-    logits = jnp.where(candidates, scores / temperature, -jnp.inf)
+    """Softmax over path scores divided by the best candidate's score.
+
+    J is an expected count of new achievements and is often far below 1, so a
+    fixed temperature on raw J is nearly uniform.  Normalising by the per-
+    decision maximum makes ``temperature`` the logit gap (in units of 1/T)
+    between the best path and a path worth nothing (e.g. a pure repeat).
+    """
+    best = jnp.max(jnp.where(candidates, scores, -jnp.inf), axis=-1, keepdims=True)
+    scale = jnp.maximum(best, 1e-6)
+    logits = jnp.where(candidates, scores / scale / temperature, -jnp.inf)
     return jax.random.categorical(key, logits).astype(jnp.int32)
 
 
