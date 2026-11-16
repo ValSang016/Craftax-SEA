@@ -269,6 +269,7 @@ def make_train(
             return select_goals(
                 keys, completed, current_node, goal_runtime.graph,
                 goal_runtime.include_new_tasks,
+                goal_runtime.per_node_category_weights,
             )
 
         def choose_graph_goals(
@@ -295,6 +296,7 @@ def make_train(
                 config.num_envs,
                 goal_runtime.graph,
                 goal_runtime.include_new_tasks,
+                goal_runtime.per_node_category_weights,
             )
         else:
             # Consume the main key exactly like the SEA path so that, with the
@@ -470,11 +472,14 @@ def make_train(
                     replay_valid = option_done
                     replay_success = goal_done
                     if use_planner:
-                        # Warmup reproduces SEA exactly: a new goal on any newly
-                        # unlocked achievement and no option timeout.  Options cut
-                        # by a non-target event are censored, so they are not
-                        # used as graph labels; late successes count as timeouts.
-                        sea_done = env_done | goal_done | info["event_happened"]
+                        # Warmup reproduces the SEA meta-controller exactly (same
+                        # regeneration rule, no option timeout).  Under the legacy
+                        # any-event rule, options cut by a non-target event are
+                        # censored and not used as graph labels; late successes
+                        # count as timeouts.
+                        sea_done = env_done | goal_done
+                        if goal_runtime.regenerate_on_any_event:
+                            sea_done = sea_done | info["event_happened"]
                         option_done = jnp.where(in_warmup, sea_done, option_done)
                         replay_valid = option_done & (
                             ~in_warmup | goal_done | env_done

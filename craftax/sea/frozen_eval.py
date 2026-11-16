@@ -100,6 +100,10 @@ def build_frozen_evaluator(run_dir, *, num_envs=256, steps_per_seed=1_000_000, n
         oracle_achievement_ids=oracle.achievement_ids,
         allow_completed_goals=allow_completed,
         repeat_target_coefficient=args.get("repeat_target_coefficient", 0.0),
+        # Runs created before these options used the earlier port's rules.
+        regenerate_on_any_event=args.get("sea_regenerate", "any") == "any",
+        per_node_category_weights=args.get("sea_category_weights", "per-category")
+        == "per-node",
     )
 
     updates, total_steps = _rollout_shape(num_envs, steps_per_seed, num_steps)

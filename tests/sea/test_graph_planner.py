@@ -7,6 +7,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from craftax.sea.dynamic_graph import DynamicGraphConfig, HighLevelTransitionBatch
+from craftax.sea.goal import GoalRuntime
 from craftax.sea.graph_planner import (
     GraphPlannerState,
     OptionModelOutput,
@@ -322,3 +323,45 @@ def test_frozen_mode_rolls_out_without_changing_any_weights():
                                                 before, now)))
     assert int(result["metrics"]["high_level_q_update_count"].sum()) == 0
     assert float(result["metrics"]["uniform_selection_fraction"].sum()) == 0.0
+
+
+def test_original_sea_category_weights_are_per_node():
+    from craftax.sea.goal import load_oracle_graph, select_goals
+
+    graph = jnp.asarray(load_oracle_graph("artifacts/oracle_graphs/craftax_classic_22.npz").graph)
+    n = 20000
+    keys = jax.random.split(jax.random.PRNGKey(0), n)
+    completed = jnp.zeros((n, 22), dtype=bool)
+    last = jnp.full((n,), 22)
+    roots = jnp.asarray(graph.sum(0) == 0)
+    for per_node, expected_ready in ((True, 40 / 130), (False, 10 / 15)):
+        goals = select_goals(keys, completed, last, graph, False, per_node)
+        assert abs(float(roots[goals].mean()) - expected_ready) < 0.02
+
+
+def test_original_sea_keeps_goal_on_non_target_event():
+    from craftax.sea.goal import GoalState, apply_goal_transition
+
+    def runtime(any_event):
+        return GoalRuntime(
+            None, None, jnp.zeros((3, 1)), 0.0, jnp.zeros((3, 3), dtype=jnp.int8),
+            include_new_tasks=False, oracle_achievement_ids=(0, 1, 2),
+            regenerate_on_any_event=any_event,
+        )
+
+    state = GoalState(jnp.array([2]), jnp.zeros((1, 3), dtype=bool), jnp.array([3]))
+    new = jnp.zeros((1, 22), dtype=bool).at[0, 0].set(True)  # non-target event
+    outcomes = []
+    for any_event in (False, True):
+        objectives = set()
+        for seed in range(30):
+            next_state, *_ = apply_goal_transition(
+                runtime(any_event), state, jax.random.PRNGKey(seed), jnp.zeros((1, 4)),
+                jnp.zeros((1,), jnp.int32), jnp.zeros((1, 4)), jnp.array([False]),
+                jnp.array([1.0]), new_achievements=new,
+            )
+            objectives.add(int(next_state.objective[0]))
+            assert bool(next_state.completed[0, 0]) and int(next_state.last_completed[0]) == 0
+        outcomes.append(objectives)
+    assert outcomes[0] == {2}          # original SEA: goal kept
+    assert outcomes[1] != {2}          # legacy port: goal redrawn

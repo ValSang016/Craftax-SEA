@@ -38,6 +38,13 @@ class GoalRuntime:
     allow_completed_goals: bool = False
     # Reward for achieving the commanded goal again in the same episode.
     repeat_target_coefficient: float = 0.0
+    # Original SEA (pairlab/iclr-23-sea) draws a new goal only when the target
+    # is achieved or the episode resets; True restores the earlier port's
+    # "new goal on any newly unlocked achievement".
+    regenerate_on_any_event: bool = False
+    # Original SEA weights categories by 80/10/10/5 *per candidate node*;
+    # False restores the earlier port's fixed per-category weights.
+    per_node_category_weights: bool = True
 
     def __post_init__(self):
         coefficients = [self.goal_success_coefficient, self.repeat_target_coefficient]
@@ -167,7 +174,9 @@ def shape_goal_reward(
     )
 
 
-def _select_one_goal(key, completed, last_completed, graph, include_new_tasks):
+def _select_one_goal(
+    key, completed, last_completed, graph, include_new_tasks, per_node_weights=True
+):
     """JAX equivalent of SEA's GraphObjectiveWrapper sampling rule."""
 
     cluster_count = graph.shape[0]
@@ -191,7 +200,11 @@ def _select_one_goal(key, completed, last_completed, graph, include_new_tasks):
     unready = remaining & ~ready
     categories = jnp.stack([continuation, neighbour, jump, unready])
     category_weights = jnp.array([80.0, 10.0, 10.0, 5.0])
-    category_weights *= jnp.any(categories, axis=1)
+    if per_node_weights:
+        # wrappers.py GraphObjectiveWrapper: p ∝ [80·|cont|, 10·|nghb|, 10·|jump|, 5·|unrd|]
+        category_weights *= categories.sum(axis=1)
+    else:
+        category_weights *= jnp.any(categories, axis=1)
 
     category_key, choice_key, unknown_key, fallback_key = jax.random.split(key, 4)
     category = jax.random.categorical(category_key, jnp.log(category_weights + 1e-8))
@@ -204,18 +217,25 @@ def _select_one_goal(key, completed, last_completed, graph, include_new_tasks):
     return jnp.where(choose_unknown, cluster_count, selected).astype(jnp.int32)
 
 
-def select_goals(keys, completed, last_completed, graph, include_new_tasks=True):
-    return jax.vmap(_select_one_goal, in_axes=(0, 0, 0, None, None))(
-        keys, completed, last_completed, graph, include_new_tasks
+def select_goals(
+    keys, completed, last_completed, graph, include_new_tasks=True,
+    per_node_weights=True,
+):
+    return jax.vmap(_select_one_goal, in_axes=(0, 0, 0, None, None, None))(
+        keys, completed, last_completed, graph, include_new_tasks, per_node_weights
     )
 
 
-def initialize_goal_state(key, num_envs, graph, include_new_tasks=True):
+def initialize_goal_state(
+    key, num_envs, graph, include_new_tasks=True, per_node_weights=True
+):
     num_objectives = graph.shape[0] + int(include_new_tasks)
     completed = jnp.zeros((num_envs, num_objectives), dtype=bool)
     last_completed = jnp.full((num_envs,), num_objectives, dtype=jnp.int32)
     keys = jax.random.split(key, num_envs)
-    objective = select_goals(keys, completed, last_completed, graph, include_new_tasks)
+    objective = select_goals(
+        keys, completed, last_completed, graph, include_new_tasks, per_node_weights
+    )
     return GoalState(objective, completed, last_completed)
 
 
@@ -362,8 +382,11 @@ def apply_goal_transition(
         health_reward=health_reward,
     )
 
-    # The legacy SEA path remains available for pixel experiments.
-    regenerate = event_happened | env_done
+    # Original SEA: a new goal only after the target succeeds or the episode
+    # resets; other new achievements update completed/last node only.
+    regenerate = goal_done | env_done
+    if runtime.regenerate_on_any_event:
+        regenerate = regenerate | event_happened
     keys = jax.random.split(key, observation.shape[0])
     selected = select_goals(
         keys,
@@ -371,6 +394,7 @@ def apply_goal_transition(
         progress_state.last_completed,
         runtime.graph,
         runtime.include_new_tasks,
+        runtime.per_node_category_weights,
     )
     objective = jnp.where(regenerate, selected, goal_state.objective)
     new_goal_state = progress_state.replace(objective=objective)

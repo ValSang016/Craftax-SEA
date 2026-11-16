@@ -44,22 +44,29 @@ COMMON = [
 
 
 def parse_condition(token):
-    """``sea`` or ``K<h>-<leaf|noleaf>-r<repeat>[-p<none|leaf|all>]``.
+    """``sea`` or ``K<h>-<leaf|noleaf>-r<repeat>[-p<none|leaf|all>][-nore]``.
 
     e.g. K2-noleaf-r1, K2-leaf-r0-pleaf (prune only the out-degree),
-    K2-leaf-r0-pall (also prune every hop by static prerequisites).
+    K2-leaf-r0-pall (also prune every hop by static prerequisites),
+    K2-leaf-r0-nore (completed achievements cannot be selected again).
     """
     if token in ("sea", "sea-orig"):
         return {"kind": token}
     try:
         parts = token.split("-")
         horizon, leaf, repeat = parts[:3]
-        prune = parts[3][1:] if len(parts) == 4 else "none"
-        assert len(parts) in (3, 4) and (len(parts) == 3 or parts[3][0] == "p")
+        prune, reselect = "none", True
+        for extra in parts[3:]:
+            if extra == "nore":
+                reselect = False
+            else:
+                assert extra[0] == "p"
+                prune = extra[1:]
         assert horizon[0] == "K" and leaf in ("leaf", "noleaf") and repeat[0] == "r"
         assert prune in ("none", "leaf", "all")
         return {"kind": "planner", "horizon": int(horizon[1:]),
-                "leaf": leaf == "leaf", "repeat": float(repeat[1:]), "prune": prune}
+                "leaf": leaf == "leaf", "repeat": float(repeat[1:]), "prune": prune,
+                "reselect": reselect}
     except (ValueError, AssertionError, IndexError):
         raise argparse.ArgumentTypeError(
             f"bad condition {token!r}; use 'sea' or e.g. 'K2-noleaf-r1'"
@@ -112,13 +119,15 @@ def build_jobs(args):
             horizon, repeat = condition["horizon"], condition["repeat"]
             label = "leaf" if condition["leaf"] else "noleaf"
             prune = condition.get("prune", "none")
+            reselect = condition.get("reselect", True)
             suffix = "" if prune == "none" else f"-prune{prune}"
+            suffix += "" if reselect else "-noreselect"
             jobs.append(job(
                 f"exp2-K{horizon}-{label}-r{repeat:g}{suffix}", seed,
                 [
                     "--high-level-controller", "graph-planner",
                     "--dynamic-warmup-steps", str(args.warmup_steps),
-                    "--allow-completed-goals", "true",
+                    "--allow-completed-goals", str(reselect).lower(),
                     "--repeat-target-coefficient", str(repeat),
                     "--allow-unready-goals", "true",
                     "--planner-horizon", str(horizon),
@@ -126,7 +135,8 @@ def build_jobs(args):
                     "--high-level-q-learning-rate", str(args.model_learning_rate),
                     "--planner-prune", prune,
                 ],
-                ["exp2", f"K{horizon}", label, f"repeat{repeat:g}", f"prune-{prune}"],
+                ["exp2", f"K{horizon}", label, f"repeat{repeat:g}", f"prune-{prune}",
+                 "reselect" if reselect else "noreselect"],
             ))
     if args.order == "seed":
         # Every condition's seed 0 first, then seed 1, then seed 2.
@@ -149,7 +159,8 @@ def command(args, job, output):
     if args.wandb_mode != "disabled":
         cmd += [
             "--wandb-project", args.wandb_project,
-            "--wandb-group", job["group"],
+            "--wandb-group", args.wandb_group or job["group"],
+            "--wandb-job-type", job["group"],
             "--wandb-name", job["name"],
             "--wandb-mode", args.wandb_mode,
             "--wandb-tags", *job["tags"], f"seed{job['seed']}",
@@ -208,6 +219,8 @@ def main():
                         help="do not verify that every GPU is visible to JAX before starting")
     parser.add_argument("--wandb-project", default="sea-dynamic3")
     parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-group",
+                        help="one W&B group for every run (the condition goes to job_type)")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
                         default="online")
     parser.add_argument("--label", default="",

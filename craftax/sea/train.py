@@ -75,6 +75,7 @@ class _WandbLogger:
         self.run = wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
             name=args.wandb_name, group=args.wandb_group, mode=args.wandb_mode,
+            job_type=getattr(args, "wandb_job_type", None),
             tags=args.wandb_tags, config=config, dir=str(Path(args.output).resolve()),
         )
         for stage in ("base", "goal"):
@@ -406,6 +407,8 @@ def run_pipeline(args):
             oracle_achievement_ids=oracle_graph.achievement_ids,
             allow_completed_goals=args.allow_completed_goals,
             repeat_target_coefficient=args.repeat_target_coefficient,
+            regenerate_on_any_event=args.sea_regenerate == "any",
+            per_node_category_weights=args.sea_category_weights == "per-node",
         )
         print(
             "[5/5] training oracle-graph-conditioned PPO-RNN; "
@@ -614,6 +617,8 @@ def run_pipeline(args):
         oracle_achievement_ids=(
             None if oracle_graph is None else oracle_graph.achievement_ids
         ),
+        regenerate_on_any_event=args.sea_regenerate == "any",
+        per_node_category_weights=args.sea_category_weights == "per-node",
     )
     goal_result = jax.jit(
         train_policy(
@@ -672,6 +677,7 @@ def build_parser():
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-name")
     parser.add_argument("--wandb-group")
+    parser.add_argument("--wandb-job-type")
     parser.add_argument(
         "--wandb-mode", choices=("online", "offline", "disabled"), default="online"
     )
@@ -755,6 +761,17 @@ def build_parser():
         default=0.0,
         help="reward for re-achieving the commanded goal within an episode "
         "(needs --allow-completed-goals true); default: 0",
+    )
+    parser.add_argument(
+        "--sea-regenerate", choices=("target", "any"), default="target",
+        help="SEA meta-controller goal regeneration: target = only after the target "
+        "succeeds or the episode ends (original SEA, default); any = after any newly "
+        "unlocked achievement (earlier port)",
+    )
+    parser.add_argument(
+        "--sea-category-weights", choices=("per-node", "per-category"), default="per-node",
+        help="80/10/10/5 weights per candidate node (original SEA, default) or per "
+        "non-empty category (earlier port)",
     )
     parser.add_argument("--no-new-tasks", action="store_true")
     parser.add_argument(
