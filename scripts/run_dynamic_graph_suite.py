@@ -44,14 +44,22 @@ COMMON = [
 
 
 def parse_condition(token):
-    """``sea`` or ``K<h>-<leaf|noleaf>-r<repeat coefficient>`` (e.g. K2-noleaf-r1)."""
+    """``sea`` or ``K<h>-<leaf|noleaf>-r<repeat>[-p<none|leaf|all>]``.
+
+    e.g. K2-noleaf-r1, K2-leaf-r0-pleaf (prune only the out-degree),
+    K2-leaf-r0-pall (also prune every hop by static prerequisites).
+    """
     if token == "sea":
         return {"kind": "sea"}
     try:
-        horizon, leaf, repeat = token.split("-")
+        parts = token.split("-")
+        horizon, leaf, repeat = parts[:3]
+        prune = parts[3][1:] if len(parts) == 4 else "none"
+        assert len(parts) in (3, 4) and (len(parts) == 3 or parts[3][0] == "p")
         assert horizon[0] == "K" and leaf in ("leaf", "noleaf") and repeat[0] == "r"
+        assert prune in ("none", "leaf", "all")
         return {"kind": "planner", "horizon": int(horizon[1:]),
-                "leaf": leaf == "leaf", "repeat": float(repeat[1:])}
+                "leaf": leaf == "leaf", "repeat": float(repeat[1:]), "prune": prune}
     except (ValueError, AssertionError, IndexError):
         raise argparse.ArgumentTypeError(
             f"bad condition {token!r}; use 'sea' or e.g. 'K2-noleaf-r1'"
@@ -92,8 +100,10 @@ def build_jobs(args):
                 continue
             horizon, repeat = condition["horizon"], condition["repeat"]
             label = "leaf" if condition["leaf"] else "noleaf"
+            prune = condition.get("prune", "none")
+            suffix = "" if prune == "none" else f"-prune{prune}"
             jobs.append(job(
-                f"exp2-K{horizon}-{label}-r{repeat:g}", seed,
+                f"exp2-K{horizon}-{label}-r{repeat:g}{suffix}", seed,
                 [
                     "--high-level-controller", "graph-planner",
                     "--dynamic-warmup-steps", str(args.warmup_steps),
@@ -103,8 +113,9 @@ def build_jobs(args):
                     "--planner-horizon", str(horizon),
                     "--planner-leaf", str(condition["leaf"]).lower(),
                     "--high-level-q-learning-rate", str(args.model_learning_rate),
+                    "--planner-prune", prune,
                 ],
-                ["exp2", f"K{horizon}", label, f"repeat{repeat:g}"],
+                ["exp2", f"K{horizon}", label, f"repeat{repeat:g}", f"prune-{prune}"],
             ))
     if args.order == "seed":
         # Every condition's seed 0 first, then seed 1, then seed 2.

@@ -282,6 +282,16 @@ def _expand(apply_fn, params, latent, num_goals, max_duration):
     return probability, duration, completed_probability, output.next_latent
 
 
+def prerequisites_met(completed, graph):
+    """Static-graph readiness: every parent of a node is completed. [..., G]."""
+    num_goals = completed.shape[-1]
+    graph = graph.astype(bool)
+    if graph.shape[0] < num_goals:  # e.g. an extra "unknown" objective
+        pad = num_goals - graph.shape[0]
+        graph = jnp.pad(graph, ((0, pad), (0, pad)))
+    return jnp.all(~graph | completed[..., :, None], axis=-2)
+
+
 def plan_path_scores(
     state: GraphPlannerState,
     observation,
@@ -294,12 +304,25 @@ def plan_path_scores(
     gamma,
     use_leaf,
     max_duration,
+    graph=None,
+    prune="none",
+    prune_width=13,
 ):
     """Return the best K-hop path score for every first goal, shape [N, G].
 
     Hop 1 enumerates all goals.  Each first goal then keeps its own beam of
     ``beam_width`` partial paths ranked by partial score.
+
+    ``prune`` uses the static prerequisite graph on the predicted completed
+    vector: "leaf" evaluates the end-node out-degree only on (at most
+    ``prune_width``) ready, uncompleted goals; "all" additionally forbids
+    goals with unmet prerequisites at every later hop (completed goals stay
+    allowed).  Hop 1 pruning is applied by the caller through ``candidates``.
     """
+    if prune not in ("none", "leaf", "all"):
+        raise ValueError("prune must be none, leaf, or all")
+    if prune != "none" and graph is None:
+        raise ValueError("prerequisite pruning needs the static graph")
 
     params = state.train_state.params
     apply_fn = state.train_state.apply_fn
@@ -333,7 +356,10 @@ def plan_path_scores(
         step_probability = path_probability[..., None] * probability
         step_elapsed = elapsed[..., None] + duration
         step_score = score[..., None] + (gamma**step_elapsed) * step_probability * new
-        step_score = jnp.where(candidates[..., None, None, :], step_score, -jnp.inf)
+        allowed = candidates[..., None, None, :]
+        if prune == "all":
+            allowed = allowed & prerequisites_met(path_completed, graph)
+        step_score = jnp.where(allowed, step_score, -jnp.inf)
         ranking = step_score
         step_completed = (
             path_completed[..., None, :] | eye | (completed_probability > 0.5)
@@ -354,7 +380,28 @@ def plan_path_scores(
         path_completed = gather(step_completed)
         latent = gather(next_latent)
 
-    if use_leaf:
+    if use_leaf and prune != "none":
+        ready = (
+            prerequisites_met(path_completed, graph)
+            & ~path_completed
+            & candidates[..., None, None, :]
+        )  # [N, G1, B, G]
+        width = min(prune_width, num_goals)
+        # Ready goals first, lowest index first among ties.
+        priority = ready.astype(jnp.float32) - 1e-3 * jnp.arange(num_goals) / num_goals
+        _, goals = jax.lax.top_k(priority, width)
+        valid = jnp.take_along_axis(ready, goals, axis=-1)
+        output = _transition(
+            apply_fn,
+            params,
+            jnp.broadcast_to(latent[..., None, :], goals.shape + latent.shape[-1:]),
+            goals,
+        )
+        probability = jax.nn.sigmoid(output.success_logit)
+        duration = jnp.clip(jnp.exp(output.log_duration), 1.0, max_duration)
+        out_degree = ((gamma**duration) * probability * valid).sum(-1)
+        score = score + (gamma**elapsed) * path_probability * out_degree
+    elif use_leaf:
         probability, duration, _, _ = _expand(
             apply_fn, params, latent, num_goals, max_duration
         )
@@ -384,7 +431,8 @@ def sample_from_scores(key, scores, candidates, temperature):
 
 
 def choose_planner_goals(
-    key, state, observation, completed, current_node, candidates, needs_goal, config
+    key, state, observation, completed, current_node, candidates, needs_goal, config,
+    graph=None,
 ):
     """Plan for at most ``planner_max_decisions`` environments per step.
 
@@ -396,21 +444,31 @@ def choose_planner_goals(
     num_envs = observation.shape[0]
     limit = min(config.planner_max_decisions, num_envs)
     priority_key, plan_key, fallback_key = jax.random.split(key, 3)
+    prune = config.planner_prune
     common = dict(
         beam_width=config.planner_beam_width,
         gamma=config.planner_gamma,
         use_leaf=config.planner_leaf,
         max_duration=float(config.goal_timeout),
+        graph=graph,
+        prune=prune,
+        prune_width=config.planner_prune_width,
     )
-    fallback_scores = plan_path_scores(
-        state, observation, completed, current_node, candidates,
-        horizon=1, **common,
-    )
-    selected = sample_from_scores(
-        fallback_key, fallback_scores, candidates, config.planner_temperature
-    )
+    if prune == "all":
+        ready = prerequisites_met(completed, graph) & candidates
+        candidates = jnp.where(ready.any(-1, keepdims=True), ready, candidates)
+
+    def one_hop(_):
+        scores = plan_path_scores(
+            state, observation, completed, current_node, candidates,
+            horizon=1, **common,
+        )
+        return sample_from_scores(
+            fallback_key, scores, candidates, config.planner_temperature
+        )
+
     if config.planner_horizon == 1 and limit == num_envs:
-        return selected, jnp.zeros((num_envs,), dtype=bool)
+        return one_hop(None), jnp.zeros((num_envs,), dtype=bool)
 
     priority = needs_goal.astype(jnp.float32) + 0.5 * jax.random.uniform(
         priority_key, (num_envs,)
@@ -428,9 +486,16 @@ def choose_planner_goals(
     planned = sample_from_scores(
         plan_key, planned_scores, candidates[index], config.planner_temperature
     )
-    selected = selected.at[index].set(planned)
     planned_mask = jnp.zeros((num_envs,), dtype=bool).at[index].set(True)
-    return selected, needs_goal & ~planned_mask
+    overflow = needs_goal & ~planned_mask
+    # The whole-batch 1-hop fallback is only computed when the K-hop budget
+    # actually overflowed in this step.
+    selected = jax.lax.cond(
+        overflow.any(), one_hop,
+        lambda _: jnp.zeros((num_envs,), dtype=jnp.int32), operand=None,
+    )
+    selected = selected.at[index].set(planned)
+    return selected, overflow
 
 
 __all__ = [
@@ -444,6 +509,7 @@ __all__ = [
     "graph_planner_loss",
     "initialize_graph_planner",
     "plan_path_scores",
+    "prerequisites_met",
     "sample_from_scores",
     "update_graph_planner",
 ]

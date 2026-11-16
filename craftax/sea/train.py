@@ -247,6 +247,8 @@ def _make_dynamic_config(args):
         planner_max_decisions=args.planner_max_decisions,
         planner_gamma=args.planner_gamma,
         planner_temperature=args.planner_temperature,
+        planner_prune=args.planner_prune,
+        planner_prune_width=args.planner_prune_width,
         model_hidden_size=args.model_hidden_size,
         model_latent_size=args.model_latent_size,
         model_target_ema=args.model_target_ema,
@@ -781,6 +783,15 @@ def build_parser():
     )
     parser.add_argument("--planner-gamma", type=float, default=0.99)
     parser.add_argument("--planner-temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--planner-prune", choices=("none", "leaf", "all"), default="none",
+        help="static-prerequisite pruning: none (default); leaf = only the end-node "
+        "out-degree; all = also forbid unmet-prerequisite goals at every hop",
+    )
+    parser.add_argument(
+        "--planner-prune-width", type=int, default=13,
+        help="max ready goals evaluated for the pruned out-degree (13 is exact for the 22-node oracle graph)",
+    )
     parser.add_argument("--model-hidden-size", type=int, default=256)
     parser.add_argument("--model-latent-size", type=int, default=128)
     parser.add_argument("--model-target-ema", type=float, default=0.995)

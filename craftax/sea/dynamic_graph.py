@@ -60,6 +60,8 @@ class DynamicGraphConfig:
     planner_max_decisions: int = 128
     planner_gamma: float = 0.99
     planner_temperature: float = 0.1
+    planner_prune: str = "none"
+    planner_prune_width: int = 13
     model_hidden_size: int = 256
     model_latent_size: int = 128
     model_target_ema: float = 0.995
@@ -103,6 +105,10 @@ class DynamicGraphConfig:
             raise ValueError("planner gamma must be in (0, 1]")
         if not np.isfinite(self.planner_temperature) or self.planner_temperature <= 0:
             raise ValueError("planner temperature must be positive")
+        if self.planner_prune not in ("none", "leaf", "all"):
+            raise ValueError("planner prune must be none, leaf, or all")
+        if self.planner_prune_width < 1:
+            raise ValueError("planner prune width must be positive")
         if not 0 <= self.model_target_ema < 1:
             raise ValueError("model target EMA must be in [0, 1)")
 

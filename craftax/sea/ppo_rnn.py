@@ -274,6 +274,7 @@ def make_train(
             return choose_planner_goals(
                 selection_key, q_state, current_observation, completed,
                 current_node, candidates, needs_goal, dynamic_config,
+                graph=goal_runtime.graph,
             )
 
         if goal_runtime is None:

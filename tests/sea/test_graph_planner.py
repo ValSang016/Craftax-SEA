@@ -237,3 +237,47 @@ def test_planner_warmup_reproduces_sea_meta_controller_exactly():
     for name in ("mean_reward", "goal_end_rate", "episode_end_rate", "value_loss", "actor_loss", "loss", "episode_count",
                  "episode_return_sum", "achievement_success_count"):
         np.testing.assert_allclose(planner[name], sea[name], rtol=1e-5, err_msg=name)
+
+
+def _pruned_scores(horizon, prune, use_leaf=True):
+    graph = jnp.zeros((3, 3), dtype=jnp.int8).at[0, 1].set(1)  # 0 -> 1
+    return plan_path_scores(
+        _toy_state(), jnp.zeros((1, 4)), jnp.zeros((1, 3), dtype=bool),
+        jnp.array([3]), jnp.ones((1, 3), dtype=bool), horizon=horizon,
+        beam_width=2, gamma=1.0, use_leaf=use_leaf, max_duration=300.0,
+        graph=graph, prune=prune,
+    )[0]
+
+
+def test_leaf_pruning_drops_unready_out_degree_only():
+    unpruned = _pruned_scores(1, "none")
+    pruned = _pruned_scores(1, "leaf")
+    # After goal 2: unpruned out-degree counts unready goal 1 (p=0.01).
+    np.testing.assert_allclose(unpruned[2], 0.7 + 0.7 * (0.6 + 0.01), atol=1e-5)
+    np.testing.assert_allclose(pruned[2], 0.7 + 0.7 * 0.6, atol=1e-5)
+    # After goal 0, goal 1 becomes ready and is kept.
+    np.testing.assert_allclose(pruned[0], unpruned[0], atol=1e-6)
+
+
+def test_hop_pruning_forbids_unready_goals_at_later_hops():
+    leaf_only = _pruned_scores(2, "leaf", use_leaf=False)
+    all_hops = _pruned_scores(2, "all", use_leaf=False)
+    np.testing.assert_allclose(leaf_only, all_hops, atol=1e-6)  # best paths are ready
+    graph = jnp.zeros((3, 3), dtype=jnp.int8).at[0, 1].set(1).at[0, 2].set(1)
+    score = plan_path_scores(
+        _toy_state(), jnp.zeros((1, 4)), jnp.zeros((1, 3), dtype=bool),
+        jnp.array([3]), jnp.ones((1, 3), dtype=bool), horizon=2, beam_width=3,
+        gamma=1.0, use_leaf=False, max_duration=300.0, graph=graph, prune="all",
+    )[0]
+    # From goal 1 (allowed at hop 1 here), hop 2 may only use goal 0: goals 1
+    # and 2 both still need goal 0.
+    np.testing.assert_allclose(score[1], 0.01 + 0.01 * 0.6, atol=1e-5)
+
+
+def test_planner_prune_option_reaches_config():
+    args = build_parser().parse_args([
+        "--symbolic", "--high-level-controller", "graph-planner",
+        "--planner-prune", "all",
+    ])
+    config = _make_dynamic_config(args)
+    assert config.planner_prune == "all" and config.planner_prune_width == 13
