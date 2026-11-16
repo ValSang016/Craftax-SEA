@@ -76,12 +76,14 @@ def test_aggregate_runs_uses_equal_seed_weighting_and_sample_std():
             "easy17_success_rate": 0.2,
             "hard4_success_rate": 0.3,
             "crafter_score21": 4.0,
+            "crafter_score22": 3.0,
         },
         {
             "achievements_per_episode21": 3.0,
             "easy17_success_rate": 0.4,
             "hard4_success_rate": 0.7,
             "crafter_score21": 8.0,
+            "crafter_score22": 5.0,
         },
     ]
 
@@ -90,3 +92,4 @@ def test_aggregate_runs_uses_equal_seed_weighting_and_sample_std():
     assert result["num_runs"] == 2
     assert result["crafter_score21"]["mean"] == 6.0
     assert np.isclose(result["crafter_score21"]["std"], np.sqrt(8.0))
+    assert result["crafter_score22"]["mean"] == 4.0

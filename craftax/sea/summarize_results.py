@@ -16,7 +16,7 @@ from craftax.sea.metrics import (
 )
 
 
-def summarize_history(path: str | Path, window: int = 50) -> dict:
+def summarize_history(path: str | Path, window: int = 100) -> dict:
     """Aggregate completed episodes from the final ``window`` PPO updates."""
 
     path = Path(path)
@@ -65,6 +65,7 @@ def summarize_history(path: str | Path, window: int = 50) -> dict:
         "crafter_score21": float(
             np.exp(np.log1p(100.0 * score21_rates).mean()) - 1.0
         ),
+        "crafter_score22": float(np.exp(np.log1p(100.0 * rates).mean()) - 1.0),
         "achievement_success_rate": {
             name: float(rate) for name, rate in zip(ACHIEVEMENT_NAMES, rates)
         },
@@ -116,6 +117,7 @@ def aggregate_runs(runs: list[dict]) -> dict:
         "easy17_success_rate",
         "hard4_success_rate",
         "crafter_score21",
+        "crafter_score22",
     )
     result = {"num_runs": len(runs)}
     for key in keys:
@@ -129,12 +131,13 @@ def aggregate_runs(runs: list[dict]) -> dict:
 
 def _print_report(runs: list[dict], aggregate: dict) -> None:
     columns = (
-        ("run", 16),
+        ("run", 34),
         ("stage", 7),
         ("updates", 9),
         ("K", 4),
         ("Easy17(%)", 11),
         ("Hard4(%)", 10),
+        ("Score22", 9),
         ("Score21", 9),
         ("Diamond(%)", 12),
         ("IronPickaxe(%)", 16),
@@ -143,14 +146,16 @@ def _print_report(runs: list[dict], aggregate: dict) -> None:
     print(" ".join("-" * width for _, width in columns))
     for run in runs:
         rates = run["achievement_success_rate"]
-        label = Path(run["history"]).parent.name
+        run_dir = Path(run["history"]).parent
+        label = f"{run_dir.parent.name}/{run_dir.name}"[-34:]
         values = (
-            label.ljust(16),
+            label.ljust(34),
             run["stage"].ljust(7),
             str(run["window_updates"]).rjust(9),
             ("-" if run["num_clusters"] is None else str(run["num_clusters"])).rjust(4),
             f"{100 * run['easy17_success_rate']:.2f}".rjust(11),
             f"{100 * run['hard4_success_rate']:.2f}".rjust(10),
+            f"{run['crafter_score22']:.2f}".rjust(9),
             f"{run['crafter_score21']:.2f}".rjust(9),
             f"{100 * rates['collect_diamond']:.2f}".rjust(12),
             f"{100 * rates['make_iron_pickaxe']:.2f}".rjust(16),
@@ -165,6 +170,7 @@ def _print_report(runs: list[dict], aggregate: dict) -> None:
         print("\nAcross-run mean +/- sample std (runs are weighted equally)")
         print(f"Easy17(%): {mean_std('easy17_success_rate', 100)}")
         print(f"Hard4(%): {mean_std('hard4_success_rate', 100)}")
+        print(f"Score22: {mean_std('crafter_score22')}")
         print(f"Score21: {mean_std('crafter_score21')}")
 
 
@@ -180,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="run directories, a run root containing seed-* dirs, or history .npz files",
     )
-    parser.add_argument("--window", type=int, default=50, help="final PPO updates")
+    parser.add_argument("--window", type=int, default=100, help="final PPO updates")
     parser.add_argument(
         "--stage",
         choices=("auto", "base", "goal"),
