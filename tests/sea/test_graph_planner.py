@@ -193,3 +193,47 @@ def test_softmax_is_scale_free():
         scores = jnp.zeros((22,)).at[5].set(scale).at[6].set(0.5 * scale)
         picks = jax.vmap(lambda k: sample_from_scores(k, scores, candidates, 0.1))(keys)
         assert float((picks == 5).mean()) > 0.97
+
+
+def test_planner_warmup_reproduces_sea_meta_controller_exactly():
+    """Same seed: exp. 2 during warmup must follow exp. 1's trajectory."""
+    from craftax.sea.env import make_sea_craftax_classic_env
+    from craftax.sea.goal import GoalRuntime, load_oracle_graph
+    from craftax.sea.ppo_rnn import PPOConfig, make_train
+
+    oracle = load_oracle_graph("artifacts/oracle_graphs/craftax_classic_22.npz")
+    config = PPOConfig(total_timesteps=8 * 16 * 4, num_envs=8, num_steps=16,
+                       update_epochs=1, num_minibatches=2, hidden_size=32,
+                       reset_ratio=2)
+
+    def runtime(allow_completed):
+        return GoalRuntime(
+            transition_network=None, transition_params=None,
+            centroids=jnp.zeros((22, 1)), threshold=0.0,
+            graph=jnp.asarray(oracle.graph), goal_success_coefficient=3.0,
+            include_new_tasks=False, oracle_achievement_ids=oracle.achievement_ids,
+            allow_completed_goals=allow_completed,
+            repeat_target_coefficient=0.0,
+        )
+
+    def env(track):
+        return make_sea_craftax_classic_env(
+            symbolic=True, idle_timeout=10000, immortal=False,
+            combat_damage_mode="cumulative", track_achievement_events=track,
+        )
+
+    sea = jax.jit(make_train(config, env(False), goal_runtime=runtime(False)))(
+        jax.random.PRNGKey(3)
+    )["metrics"]
+    dynamic = DynamicGraphConfig(
+        controller="graph-planner", warmup_steps=10**9, replay_capacity=64,
+        batch_size=8, min_replay_size=8, allow_completed_goals=True,
+        allow_unready_goals=True, model_hidden_size=16, model_latent_size=8,
+    )
+    planner = jax.jit(make_train(
+        config, env(True), goal_runtime=runtime(True), dynamic_config=dynamic
+    ))(jax.random.PRNGKey(3))["metrics"]
+    assert int(sea["episode_count"].sum()) > 0
+    for name in ("mean_reward", "goal_end_rate", "episode_end_rate", "value_loss", "actor_loss", "loss", "episode_count",
+                 "episode_return_sum", "achievement_success_count"):
+        np.testing.assert_allclose(planner[name], sea[name], rtol=1e-5, err_msg=name)

@@ -286,7 +286,10 @@ def make_train(
                 goal_runtime.include_new_tasks,
             )
         else:
-            key, q_key, goal_key = jax.random.split(key, 3)
+            # Consume the main key exactly like the SEA path so that, with the
+            # same seed, the meta-controller warmup reproduces exp. 1 exactly.
+            key, goal_key = jax.random.split(key)
+            q_key = jax.random.fold_in(goal_key, 1)
             completed = jnp.zeros(
                 (config.num_envs, num_objectives), dtype=bool
             )
@@ -532,10 +535,13 @@ def make_train(
                     selected_new = ~jnp.take_along_axis(
                         progress_state.completed, selected[:, None], axis=1
                     )[:, 0]
-                    objective = jnp.where(
+                    # Keep ``objective`` as the goal acted on at this step: the
+                    # PPO transition below must be conditioned on it, not on
+                    # the goal chosen for the next step.
+                    next_objective = jnp.where(
                         option_done, selected, goal_state.objective
                     )
-                    goal_state = progress_state.replace(objective=objective)
+                    goal_state = progress_state.replace(objective=next_objective)
                     dynamic_state = dynamic_state.replace(
                         replay=replay,
                         start_observation=jnp.where(
@@ -673,7 +679,7 @@ def make_train(
                     )
                 )
                 initial_q_metrics = {name: zero for name in metric_names}
-                key, q_update_key = jax.random.split(key)
+                q_update_key = jax.random.fold_in(key, 2)
 
                 def q_update(_, loop_state):
                     q_state, sample_key, metric_sums = loop_state
