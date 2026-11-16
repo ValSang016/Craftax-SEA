@@ -78,6 +78,9 @@ def build_jobs(args):
                     ],
                     ["exp2", f"K{horizon}", label],
                 ))
+    if args.order == "seed":
+        # Every condition's seed 0 first, then seed 1, then seed 2.
+        jobs.sort(key=lambda item: args.seeds.index(item["seed"]))
     return jobs
 
 
@@ -132,14 +135,20 @@ def main():
     parser.add_argument("--horizons", nargs="+", type=int, default=[2, 3, 4])
     parser.add_argument("--leaf", nargs="+", type=lambda v: v.lower() == "true",
                         default=[True, False], metavar="BOOL")
+    parser.add_argument(
+        "--order", choices=("horizon", "seed"), default="horizon",
+        help="queue order: by K (all seeds per K) or by seed (all conditions per seed)",
+    )
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--warmup-steps", type=int, default=50_000_000)
     parser.add_argument("--model-learning-rate", type=float, default=3e-4)
     parser.add_argument("--graph", type=Path, default=DEFAULT_GRAPH)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--python", default=sys.executable)
-    parser.add_argument("--jax-platforms", default="cuda",
-                        help="JAX_PLATFORMS for children; 'cuda' fails loudly instead of using CPU")
+    parser.add_argument("--jax-platforms", default="cuda,cpu",
+                        help="JAX_PLATFORMS for children (cpu is needed for progress callbacks)")
+    parser.add_argument("--skip-gpu-check", action="store_true",
+                        help="do not verify that every GPU is visible to JAX before starting")
     parser.add_argument("--wandb-project", default="sea-dynamic3")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
@@ -161,6 +170,18 @@ def main():
             print(f"# {job['name']}\n{shlex.join(job['command'])}\n")
         print(f"{len(jobs)} jobs, {len(args.gpus) * args.jobs_per_gpu} concurrent slots")
         return
+
+    if not args.skip_gpu_check:
+        for gpu in args.gpus:
+            check = subprocess.run(
+                [args.python, "-c", "import jax; print(jax.default_backend())"],
+                cwd=REPO, capture_output=True, text=True,
+                env={**{k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"},
+                     "CUDA_VISIBLE_DEVICES": str(gpu)},
+            )
+            backend = check.stdout.strip().splitlines()[-1:] or ["?"]
+            if backend[0] != "gpu":
+                sys.exit(f"GPU {gpu} is not usable by JAX (backend={backend[0]}):\n{check.stderr[-2000:]}")
 
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / "manifest.json", {
