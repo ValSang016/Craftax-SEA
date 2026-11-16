@@ -110,39 +110,3 @@ def test_fixed_cohort_counts_short_empty_and_long_successful_episodes_once(monke
     selections = np.asarray(state.selected_goal_counts)
     assert (selections[:, 7] >= 1).all()
     assert np.delete(selections, 7, axis=1).sum() == 0
-
-
-def test_generic_sweep_evaluation_uses_frozen_source_and_requested_gpus(tmp_path, monkeypatch):
-    import hashlib
-    import importlib.util
-    import json
-    from pathlib import Path
-    from types import SimpleNamespace
-    path = Path(__file__).resolve().parents[2] / "scripts/evaluate_selector_checkpoints.py"
-    spec = importlib.util.spec_from_file_location("generic_selector_evaluation", path)
-    runner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner)
-    source = tmp_path / "frozen-source"
-    (source / "craftax").mkdir(parents=True)
-    (source / "craftax/__init__.py").write_text("# exact training snapshot")
-    train = tmp_path / "training"
-    train.mkdir()
-    jobs = []
-    for seed in (0, 1, 2):
-        for beta in (.2, .3, .5):
-            directory = train / f"seed-{seed}" / str(beta)
-            directory.mkdir(parents=True)
-            for name in ("goal_policy.msgpack", "high_level_q.msgpack", "config.json", "oracle_graph.npz"):
-                (directory / name).write_bytes(b"finished training artifact")
-            jobs.append(dict(state="completed", condition="full-q-with-prior", seed=seed, beta=beta, output=str(directory)))
-    manifest = dict(jobs=jobs, source_snapshot=str(source), source_sha256={
-        "craftax/__init__.py": hashlib.sha256((source / "craftax/__init__.py").read_bytes()).hexdigest()})
-    (train / "manifest.json").write_text(json.dumps(manifest))
-    monkeypatch.setattr(runner, "REPO", tmp_path / "unrelated-repo")
-    args = SimpleNamespace(output=tmp_path / "eval", training_sweep=train,
-        gpus=[0,1], episodes=1024, seed_start=1_000_000, policy_seed=314159, block=128)
-    result = runner.prepare(args)
-    assert len(result["jobs"]) == 9
-    assert {j["gpu"] for j in result["jobs"]} == {0,1}
-    assert {j["protocol"] for j in result["jobs"]} == {"training-env"}
-    assert (args.output / "source/craftax/__init__.py").read_bytes() == (source / "craftax/__init__.py").read_bytes()

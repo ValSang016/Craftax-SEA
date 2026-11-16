@@ -61,67 +61,6 @@ option을 종료할 뿐이며, worker target/non-target 보상과 환경 reward/
 achievement를 달성하면 해당 non-target 보상도 유지합니다. 기존 empty-set fallback은
 유지되어, 모든 graph node를 달성한 퇴화 상태에서는 전체 node를 다시 허용합니다.
 
-대표 조건 `ready-repeat`=(false,true), `all-repeat`=(true,true),
-`all-once`=(true,false)에 대해 β=0/0.8/10, seed=0/1/2를 실행하려면:
-
-```bash
-/root/miniconda3/envs/craftax/bin/python scripts/run_goal_candidate_sweep.py \
-  --output runs/oracle-goal-eligibility-new --gpus 0 1 2 3
-```
-
-Runner는 기존 β=0.8/seed0 설정을 기준으로 300M step씩 총 27개를 만들고,
-GPU별 한 process를 실행합니다. 각 완료 직후 대기 중인 다음 run을 배정합니다.
-실행 source와 graph를 output 아래에 복사해 고정하며, `manifest.json`에 전체 명령과
-source hash를, `status.json`에 진행 상태를 저장합니다. W&B는 로컬 offline 모드입니다.
-완료 후 `final-window.csv/json`에 마지막 458 update의 episode 집계 성능을 생성합니다.
-기존 output을 덮어쓰지 않습니다. `--dry-run`은 학습 없이 실행 계획만 생성합니다.
-
-Structural-prior/selector ablation은 아래처럼 먼저 계획만 생성합니다.
-
-```bash
-/root/miniconda3/envs/craftax/bin/python scripts/run_goal_candidate_sweep.py \
-  --suite selector-ablations --dry-run \
-  --output runs/oracle-selector-ablations-new --gpus 0 1 2 3
-```
-
-이 suite는 모두 unready=true/completed=false로 고정하고, lambda=0인 residual
-beta=0.8/10 및 lambda=1인 base-q beta=0.5/0.3/0.2를 seed=0/1/2에 배정합니다.
-총 15개이며 기존 run과 같은 300M step, warmup 30M step을 사용합니다.
-`--execute`가 없으면 이 suite는 항상 준비만 하고 학습 process를 시작하지 않습니다.
-검토 및 사용자 승인 후에는 준비한 source와 명령을 그대로 사용합니다.
-
-```bash
-/root/miniconda3/envs/craftax/bin/python scripts/run_goal_candidate_sweep.py \
-  --output runs/oracle-selector-ablations-new --start-prepared --execute
-```
-
-준비한 계획은 모든 job이 queued이고 run output이 아직 없을 때만 시작할 수 있습니다.
-source/graph hash를 다시 확인하며, 새 실험의 최종 집계에는 lambda와 signal도 기록합니다.
-기존 27개 후보 실험용 beta 유의성 분석은 이 15개 suite에 적용하지 않습니다.
-
-Full Q 선택 비교는 `--suite full-q`로 준비합니다. Unready 포함·완료 goal 재선택 금지,
-lambda=1로 고정하고 beta=0.2/0.3/0.5 × seed=0/1/2, 총 9개를 만듭니다.
-`--gpus 0 1`로 지정한 계획은 시작·재시작 시 GPU를 따로 지정하지 않아도 저장된
-0·1번 GPU 목록을 상속합니다. 이 suite도 실제 시작에는 `--execute`가 필요합니다.
-
-`evaluate_selector_checkpoints.py --training-sweep RUN_ROOT --gpus 0 1 --output EVAL_ROOT`는
-해당 sweep의 완료 checkpoint 전부를 원래 고정 source로 평가합니다. Selector의
-residual/base-q/full-q 모드를 각각 적용하며, 기존 평가와 같은 환경 seed 1,000,000부터
-1,024개 episode를 끝까지 실행합니다. 학습 update와 optimistic reset은 없습니다.
-
-완료된 run을 보존하면서 실패한 run만 다시 실행하려면 같은 output에
-`--resume-failed`를 붙입니다. 원래 고정한 source/graph hash를 검증하고,
-실패한 시도의 로그와 기존 manifest를 `retry-attempts/`에 보존한 뒤 실패한
-run만 처음부터 실행합니다. `--resume-failed --dry-run`은 파일을 변경하지 않고
-재실행할 대상을 검증합니다. GPU가 사라지면 새 run 배정을 GPU 복구까지 보류합니다.
-
-각 run이 끝나면 `beta-comparison/`도 갱신합니다. β=10−0.8의 마지막 구간
-Crafter score를 같은 training seed끼리 비교하며 paired t-test, 차이의 95% CI,
-exact paired sign-flip test와 세 조건에 대한 Holm 보정을 기록합니다.
-세 seed가 모두 끝나기 전에는 중간 집계로 표시합니다. Episode나 update를
-독립 seed로 취급하지 않습니다. Seed 3쌍의 양측 exact 검정 최소 p-value는
-0.25이며, 유의하지 않다는 결과만으로 성능 동등성을 주장할 수 없습니다.
-
 `--high-level-controller residual`은 state-conditioned Q residual을 사용하며,
 `--high-level-controller sea-meta-controller`는 Q 없이 SEA의 기존
 `80/10/10/5` graph meta-controller를 사용합니다.
@@ -145,6 +84,45 @@ arrays are required, while `achievement_names` is optional. Dynamic Q parameters
 are saved in `high_level_q.msgpack`; per-update high-level metrics are included
 in `goal_metrics_history.npz`.
 
+## Supervised state-conditioned graph + K-hop planner (실험 2)
+
+`--high-level-controller graph-planner`는 그래프를 지도학습 option 모델
+`F(s_t, c_t, g_i, g_j)`로 학습합니다. 출력은 성공 확률 p(=state-conditioned edge),
+성공 시 소요 스텝 τ, option 중 사망 확률, 성공 후 completed vector, 다음 latent,
+그리고 latent에서 복원한 inventory 12 + health/food/drink/energy 4입니다.
+모든 head는 관측된 option 결과를 라벨로 하는 지도학습이며 TD/bootstrapping/
+policy gradient를 쓰지 않습니다. 다음 latent는 EMA target encoder와의
+consistency loss로 학습합니다. 학습 데이터는 같은 run의 high-level replay입니다.
+
+Planner는 F를 K hop 굴려 경로를 평가합니다.
+
+    J = Σ_k γ^{T_k} ∏_{i≤k} p_i · 1[g_k 미완료]
+        (+ γ^{T_K} ∏p · Σ_j γ^{τ_j} p_j 1[g_j 미완료]   ← --planner-leaf true)
+
+첫 hop은 22개 goal 전부, 이후는 첫 goal별 beam(`--planner-beam-width`)으로
+탐색하고, 첫 goal별 최고 J에 softmax(`--planner-temperature`)로 goal을 뽑습니다.
+한 step에 K-hop 계획은 최대 `--planner-max-decisions` env까지만 하고 나머지는
+1-hop으로 대체합니다(`planner_overflow_fraction` 기록).
+
+`--dynamic-warmup-steps` 동안은 실험 1과 같은 SEA meta-controller(어떤 새
+achievement든 생기면 goal 재선택, timeout 없음, PPO bootstrap은 goal 성공/episode
+종료)를 사용합니다. 이 기간에 다른 achievement로 잘린 option은 라벨이 불완전하므로
+replay에 넣지 않습니다. 모델은 warmup 중에도 계속 학습됩니다.
+
+주요 지표: `graph_*_loss`, `graph_brier`, `graph_edge_state_std`(같은 goal의 p가
+state에 따라 얼마나 변하는지; 정적 그래프면 0), `selected_new_goal_fraction`,
+`selected_goal_success_rate`.
+
+전체 비교(실험 1 + K=2/3/4 × leaf/noleaf × seed 0/1/2, 300M, warmup 50M)는
+GPU queue로 실행합니다. W&B project `sea-dynamic3`, group=조건, name=조건-seed.
+
+```bash
+python scripts/run_dynamic_graph_suite.py --output runs/sea-dynamic3 --dry-run
+python scripts/run_dynamic_graph_suite.py --output runs/sea-dynamic3 --gpus 0 1 2 3 --jobs-per-gpu 1
+```
+
+같은 명령을 다시 실행하면 완료된 run은 건너뛰고 미완료 run만 다시 시작합니다.
+
 ## 모듈
 
 | 모듈 | 역할 |
@@ -155,6 +133,7 @@ in `goal_metrics_history.npz`.
 | `graph.py` | learned/oracle 공통 temporal graph 생성 및 축약 |
 | `goal.py` | 분류, 목표 선택, 보상 및 oracle 선택 분기 |
 | `dynamic_graph.py` | symbolic state split, high-level replay, Q learning 및 dynamic edge |
+| `graph_planner.py` | 지도학습 option 모델(state-conditioned edge)과 K-hop planner |
 | `ppo_rnn.py`, `networks.py` | 기본 PPO-GRU 및 픽셀 모델 |
 | `env.py`, `vector_env.py`, `rollout.py` | 환경 규칙과 수집 |
 | `metrics.py`, `checkpoint.py` | episode 지표, parameter 저장 |

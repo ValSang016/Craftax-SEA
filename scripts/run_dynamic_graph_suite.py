@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Run the exp. 1 vs exp. 2 comparison on a multi-GPU queue.
+
+exp1  : oracle graph + SEA meta-controller, 300M goal steps.
+exp2  : SEA meta-controller warmup (50M), then the supervised state-conditioned
+        graph + K-hop planner for the rest of the 300M.  K in {2,3,4}, with and
+        without the end-node out-degree term ("leaf" / "noleaf").
+
+Jobs are queued in the order exp1 + K=2, then K=3, then K=4 (seeds 0,1,2 each),
+and handed to the first free GPU slot.  Each W&B run is grouped by condition so
+the project's grouped view shows seed means per condition.
+
+    python scripts/run_dynamic_graph_suite.py --output runs/sea-dynamic3 --dry-run
+    python scripts/run_dynamic_graph_suite.py --output runs/sea-dynamic3 --gpus 0 1 2 3
+
+Re-running the same command resumes: finished runs (goal_metrics.json) are
+skipped, and unfinished run directories are moved aside and restarted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_GRAPH = REPO / "artifacts/oracle_graphs/craftax_classic_22.npz"
+
+COMMON = [
+    "--symbolic",
+    "--no-new-tasks",
+    "--immortal", "true",
+    "--idle-timeout", "10000",
+    "--combat-damage-mode", "cumulative",
+    "--high-level-goal-timeout", "300",
+]
+
+
+def build_jobs(args):
+    def job(name, seed, extra, tags):
+        return {
+            "name": f"{name}-s{seed}",
+            "group": name,
+            "seed": seed,
+            "args": extra,
+            "tags": tags,
+        }
+
+    jobs = []
+    for index, horizon in enumerate(args.horizons):
+        if index == 0:
+            for seed in args.seeds:
+                jobs.append(job(
+                    "exp1-sea-meta", seed,
+                    ["--high-level-controller", "sea-meta-controller"],
+                    ["exp1", "sea-meta"],
+                ))
+        for leaf in args.leaf:
+            label = "leaf" if leaf else "noleaf"
+            for seed in args.seeds:
+                jobs.append(job(
+                    f"exp2-K{horizon}-{label}", seed,
+                    [
+                        "--high-level-controller", "graph-planner",
+                        "--dynamic-warmup-steps", str(args.warmup_steps),
+                        "--allow-completed-goals", "true",
+                        "--allow-unready-goals", "true",
+                        "--planner-horizon", str(horizon),
+                        "--planner-leaf", str(leaf).lower(),
+                        "--high-level-q-learning-rate", str(args.model_learning_rate),
+                    ],
+                    ["exp2", f"K{horizon}", label],
+                ))
+    return jobs
+
+
+def command(args, job, output):
+    cmd = [
+        args.python, "-m", "craftax.sea.train",
+        *COMMON,
+        "--graph-path", str(args.graph),
+        "--goal-timesteps", str(args.goal_timesteps),
+        "--seed", str(job["seed"]),
+        "--log-interval", str(args.log_interval),
+        "--output", str(output),
+        *job["args"],
+    ]
+    if args.wandb_mode != "disabled":
+        cmd += [
+            "--wandb-project", args.wandb_project,
+            "--wandb-group", job["group"],
+            "--wandb-name", job["name"],
+            "--wandb-mode", args.wandb_mode,
+            "--wandb-tags", *job["tags"], f"seed{job['seed']}",
+        ]
+        if args.wandb_entity:
+            cmd += ["--wandb-entity", args.wandb_entity]
+    return cmd
+
+
+def write_json(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def git_revision():
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
+            text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--gpus", nargs="+", type=int, default=[0, 1, 2, 3])
+    parser.add_argument("--jobs-per-gpu", type=int, default=1,
+                        help="concurrent runs per GPU; memory is split evenly")
+    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument("--horizons", nargs="+", type=int, default=[2, 3, 4])
+    parser.add_argument("--leaf", nargs="+", type=lambda v: v.lower() == "true",
+                        default=[True, False], metavar="BOOL")
+    parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
+    parser.add_argument("--warmup-steps", type=int, default=50_000_000)
+    parser.add_argument("--model-learning-rate", type=float, default=3e-4)
+    parser.add_argument("--graph", type=Path, default=DEFAULT_GRAPH)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--jax-platforms", default="cuda",
+                        help="JAX_PLATFORMS for children; 'cuda' fails loudly instead of using CPU")
+    parser.add_argument("--wandb-project", default="sea-dynamic3")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
+                        default="online")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.jobs_per_gpu < 1:
+        parser.error("--jobs-per-gpu must be positive")
+    args.graph = args.graph.expanduser().resolve()
+
+    root = Path(args.output).expanduser().resolve()
+    jobs = build_jobs(args)
+    for job in jobs:
+        job["output"] = str(root / job["group"] / f"seed-{job['seed']}")
+        job["command"] = command(args, job, job["output"])
+
+    if args.dry_run:
+        for job in jobs:
+            print(f"# {job['name']}\n{shlex.join(job['command'])}\n")
+        print(f"{len(jobs)} jobs, {len(args.gpus) * args.jobs_per_gpu} concurrent slots")
+        return
+
+    root.mkdir(parents=True, exist_ok=True)
+    write_json(root / "manifest.json", {
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "git_revision": git_revision(),
+        "argv": sys.argv,
+        "jobs": jobs,
+    })
+    slots = [gpu for gpu in args.gpus for _ in range(args.jobs_per_gpu)]
+    pending = []
+    for job in jobs:
+        output = Path(job["output"])
+        if (output / "goal_metrics.json").is_file():
+            job["state"] = "done"
+            continue
+        if output.exists():
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output.rename(output.with_name(f"{output.name}.incomplete-{stamp}"))
+        job["state"] = "queued"
+        pending.append(job)
+
+    running = {}
+    stopping = False
+
+    def stop(signum, _frame):
+        nonlocal stopping
+        stopping = True
+        for process, _, _ in running.values():
+            process.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    def status():
+        write_json(root / "status.json", {
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "supervisor_pid": os.getpid(),
+            "jobs": [
+                {k: job.get(k) for k in ("name", "state", "gpu", "pid", "returncode", "output")}
+                for job in jobs
+            ],
+        })
+
+    status()
+    while (pending or running) and not stopping:
+        free = [slot for slot in range(len(slots)) if slot not in running]
+        while pending and free:
+            slot = free.pop(0)
+            job = pending.pop(0)
+            output = Path(job["output"])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            log = (output.parent / f"seed-{job['seed']}.log").open("a", encoding="utf-8")
+            environment = dict(os.environ)
+            environment.pop("LD_LIBRARY_PATH", None)
+            environment.update({
+                "CUDA_VISIBLE_DEVICES": str(slots[slot]),
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": f"{0.9 / args.jobs_per_gpu:.2f}",
+                "JAX_PLATFORMS": args.jax_platforms,
+            })
+            process = subprocess.Popen(
+                job["command"], cwd=REPO, env=environment,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            job.update(state="running", gpu=slots[slot], pid=process.pid)
+            running[slot] = (process, job, log)
+            print(f"[start] {job['name']} gpu={slots[slot]} pid={process.pid}", flush=True)
+            status()
+        time.sleep(10)
+        for slot, (process, job, log) in list(running.items()):
+            code = process.poll()
+            if code is None:
+                continue
+            log.close()
+            del running[slot]
+            job.update(state="done" if code == 0 else "failed", returncode=code)
+            print(f"[{job['state']}] {job['name']} returncode={code}", flush=True)
+            status()
+
+    for process, job, log in running.values():
+        process.wait()
+        log.close()
+        job.update(state="stopped", returncode=process.returncode)
+    status()
+    failed = [job["name"] for job in jobs if job.get("state") == "failed"]
+    if failed:
+        print("failed: " + ", ".join(failed), flush=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

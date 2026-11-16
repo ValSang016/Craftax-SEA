@@ -196,12 +196,40 @@ def _progress_reporter(output, stage, config, wandb_logger=None):
     return report
 
 
+DYNAMIC_CONTROLLERS = ("residual", "graph-planner")
+
+
+def _high_level_params(dynamic_config, dynamic_state):
+    if dynamic_config.controller == "graph-planner":
+        return {
+            "option_model": dynamic_state.q_state.train_state.params,
+            "option_model_target": dynamic_state.q_state.target_params,
+        }
+    return {
+        "full_q": dynamic_state.q_state.full_q.params,
+        "base_q": dynamic_state.q_state.base_q.params,
+        "target_full_q": dynamic_state.q_state.target_full_params,
+    }
+
+
 def _make_dynamic_config(args):
-    if args.pixels or args.high_level_controller != "residual":
+    if args.pixels or args.high_level_controller not in DYNAMIC_CONTROLLERS:
         if args.dynamic_lambda != 1.0 or args.dynamic_score_source != "residual":
             raise ValueError("dynamic scoring options require --symbolic --high-level-controller residual")
+        if args.high_level_controller == "graph-planner":
+            raise ValueError("--high-level-controller graph-planner requires --symbolic")
         return None
     config = DynamicGraphConfig(
+        controller=args.high_level_controller,
+        planner_horizon=args.planner_horizon,
+        planner_leaf=args.planner_leaf,
+        planner_beam_width=args.planner_beam_width,
+        planner_max_decisions=args.planner_max_decisions,
+        planner_gamma=args.planner_gamma,
+        planner_temperature=args.planner_temperature,
+        model_hidden_size=args.model_hidden_size,
+        model_latent_size=args.model_latent_size,
+        model_target_ema=args.model_target_ema,
         warmup_steps=args.dynamic_warmup_steps,
         residual_weight=args.dynamic_beta,
         structural_prior_weight=args.dynamic_lambda,
@@ -237,8 +265,8 @@ def run_pipeline(args):
         load_oracle_graph(oracle_source) if oracle_source is not None else None
     )
     if args.allow_unready_goals or args.allow_completed_goals:
-        if args.pixels or args.high_level_controller != "residual":
-            raise ValueError("goal eligibility options require --symbolic --high-level-controller residual")
+        if args.pixels or args.high_level_controller not in DYNAMIC_CONTROLLERS:
+            raise ValueError("goal eligibility options require --symbolic and a residual or graph-planner controller")
     if args.allow_completed_goals and oracle_graph is None:
         raise ValueError("--allow-completed-goals true requires an achievement-indexed --graph-path")
     dynamic_config = _make_dynamic_config(args)
@@ -381,11 +409,7 @@ def run_pipeline(args):
             dynamic_state = goal_result["runner_state"][7]
             save_params(
                 output / "high_level_q.msgpack",
-                {
-                    "full_q": dynamic_state.q_state.full_q.params,
-                    "base_q": dynamic_state.q_state.base_q.params,
-                    "target_full_q": dynamic_state.q_state.target_full_params,
-                },
+                _high_level_params(dynamic_config, dynamic_state),
             )
         goal_metrics = _save_metric_summary(
             output / "goal_metrics.json", goal_result["metrics"]
@@ -584,11 +608,7 @@ def run_pipeline(args):
         dynamic_state = goal_result["runner_state"][7]
         save_params(
             output / "high_level_q.msgpack",
-            {
-                "full_q": dynamic_state.q_state.full_q.params,
-                "base_q": dynamic_state.q_state.base_q.params,
-                "target_full_q": dynamic_state.q_state.target_full_params,
-            },
+            _high_level_params(dynamic_config, dynamic_state),
         )
     goal_metrics = _save_metric_summary(
         output / "goal_metrics.json", goal_result["metrics"]
@@ -712,13 +732,30 @@ def build_parser():
     )
     parser.add_argument(
         "--high-level-controller",
-        choices=("residual", "sea-meta-controller"),
+        choices=("residual", "sea-meta-controller", "graph-planner"),
         default="residual",
         help=(
             "symbolic high-level goal selector: configurable Q scoring "
-            "(default) or SEA's original graph meta-controller"
+            "(default), SEA's original graph meta-controller, or the "
+            "supervised state-conditioned graph with a K-hop planner "
+            "(SEA meta-controller during --dynamic-warmup-steps)"
         ),
     )
+    parser.add_argument("--planner-horizon", type=int, default=3, help="K hops")
+    parser.add_argument(
+        "--planner-leaf", type=_parse_bool, default=True, metavar="BOOL",
+        help="add the end node's discounted out-degree to each path score",
+    )
+    parser.add_argument("--planner-beam-width", type=int, default=4)
+    parser.add_argument(
+        "--planner-max-decisions", type=int, default=128,
+        help="environments planned with K hops per step; the rest use 1 hop",
+    )
+    parser.add_argument("--planner-gamma", type=float, default=0.99)
+    parser.add_argument("--planner-temperature", type=float, default=0.1)
+    parser.add_argument("--model-hidden-size", type=int, default=256)
+    parser.add_argument("--model-latent-size", type=int, default=128)
+    parser.add_argument("--model-target-ema", type=float, default=0.995)
     parser.add_argument(
         "--dynamic-warmup-steps", type=int, default=30_000_000
     )

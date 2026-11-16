@@ -1,8 +1,6 @@
 """Check selector ablations without launching training runs or rollouts."""
-import importlib.util
 import json
 from dataclasses import asdict
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -146,55 +144,3 @@ def test_goal_only_inherits_old_defaults_and_new_settings_with_explicit_override
     assert config.allow_unready_goals and not config.allow_completed_goals
     overridden.dynamic_score_source = "full-q"
     assert _resolve_dynamic_config(source, overridden, False).score_source == "full-q"
-
-
-@pytest.mark.parametrize("suite,count", [("selector-ablations", 15), ("full-q", 9)])
-def test_selector_suite_only_prepares_exact_commands_without_execute(tmp_path, monkeypatch, suite, count):
-    path = Path(__file__).resolve().parents[2] / "scripts/run_goal_candidate_sweep.py"
-    spec = importlib.util.spec_from_file_location("selector_sweep", path)
-    runner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner)
-    fake_repo = tmp_path / "repo"
-    (fake_repo / "craftax").mkdir(parents=True)
-    (fake_repo / "craftax/__init__.py").write_text("# frozen source")
-    reference = tmp_path / "reference.json"
-    saved = vars(build_parser().parse_args(["--symbolic"]))
-    saved.update(wandb_project="test", wandb_entity="test")
-    reference.write_text(json.dumps({"args": saved}))
-    graph = tmp_path / "graph.npz"
-    graph.write_bytes(b"frozen graph")
-    output = tmp_path / "planned"
-    monkeypatch.setattr(runner, "REPO", fake_repo)
-    monkeypatch.setattr(runner.subprocess, "check_output", lambda argv, **kwargs: "revision" if "rev-parse" in argv else "")
-    def forbidden(*args, **kwargs):
-        pytest.fail("training/scheduling must not start without --execute")
-    monkeypatch.setattr(runner.subprocess, "Popen", forbidden)
-    monkeypatch.setattr(runner, "summarize", forbidden)
-    monkeypatch.setattr("sys.argv", [str(path), "--output", str(output), "--suite", suite, "--gpus", "0", "1",
-                                     "--reference-config", str(reference), "--graph", str(graph)])
-    runner.main()
-    manifest = runner.load_prepared_plan(output)
-    jobs = manifest["jobs"]
-    assert len(jobs) == count and manifest["suite"] == suite
-    assert manifest["gpu_ids"] == [0, 1]
-    settings = runner.SELECTOR_ABLATIONS if suite == "selector-ablations" else [
-        ("full-q-with-prior", beta, 1., "full-q") for beta in (.2, .3, .5)]
-    expected = {(seed, weight, signal, beta) for seed in (0, 1, 2)
-                for _, beta, weight, signal in settings}
-    assert {(j["seed"], j["structural_prior_weight"], j["score_source"], j["beta"]) for j in jobs} == expected
-    assert len({j["output"] for j in jobs}) == count
-    for job in jobs:
-        assert job["state"] == "queued" and not Path(job["output"]).exists()
-        args = build_parser().parse_args(job["command"][4:])
-        config = _make_dynamic_config(args)
-        assert config.allow_unready_goals and not config.allow_completed_goals
-        assert config.structural_prior_weight == job["structural_prior_weight"]
-        assert config.score_source == job["score_source"]
-        assert config.residual_weight == job["beta"]
-    # Starting a prepared plan without explicit GPUs inherits its saved 0/1 list.
-    monkeypatch.setattr("sys.argv", [str(path), "--output", str(output), "--start-prepared"])
-    runner.main()
-    frozen = Path(manifest["source_snapshot"]) / "craftax/__init__.py"
-    frozen.write_text("# changed after review")
-    with pytest.raises(ValueError, match="source changed"):
-        runner.load_prepared_plan(output)

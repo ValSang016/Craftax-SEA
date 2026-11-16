@@ -28,6 +28,13 @@ from craftax.sea.goal import (
     advance_goal_progress,
     apply_goal_transition,
     initialize_goal_state,
+    select_goals,
+)
+from craftax.sea.graph_planner import (
+    GRAPH_METRIC_NAMES,
+    choose_planner_goals,
+    initialize_graph_planner,
+    update_graph_planner,
 )
 from craftax.sea.metrics import rollout_episode_metrics
 from craftax.sea.networks import ActorCriticRNN, ScannedGRU
@@ -84,6 +91,8 @@ class DynamicStepMetrics(NamedTuple):
     duration: jax.Array
     selected_goal: jax.Array
     uniform_selection: jax.Array
+    planner_overflow: jax.Array
+    selected_new: jax.Array
 
 
 @struct.dataclass
@@ -155,6 +164,9 @@ def make_train(
     action_dim = env.action_space(params).n
     num_objectives = 0 if goal_runtime is None else goal_runtime.num_objectives
     completed_width = max(1, num_objectives)
+    use_planner = (
+        dynamic_config is not None and dynamic_config.controller == "graph-planner"
+    )
 
     def learning_rate(count):
         if not config.anneal_learning_rate:
@@ -242,6 +254,27 @@ def make_train(
                 selection_key, candidates, scores, jnp.asarray(False)
             )
 
+        def choose_meta_controller_goals(selection_key, completed, current_node):
+            keys = jax.random.split(selection_key, config.num_envs)
+            return select_goals(
+                keys, completed, current_node, goal_runtime.graph,
+                goal_runtime.include_new_tasks,
+            )
+
+        def choose_graph_goals(
+            selection_key, current_observation, completed, current_node,
+            needs_goal, q_state,
+        ):
+            candidates = get_goal_candidates(
+                completed, goal_runtime.graph, goal_runtime.include_new_tasks,
+                allow_unready_goals=dynamic_config.allow_unready_goals,
+                allow_completed_goals=dynamic_config.allow_completed_goals,
+            )
+            return choose_planner_goals(
+                selection_key, q_state, current_observation, completed,
+                current_node, candidates, needs_goal, dynamic_config,
+            )
+
         if goal_runtime is None:
             goal_state = None
         elif dynamic_config is None:
@@ -260,21 +293,36 @@ def make_train(
             current_node = jnp.full(
                 (config.num_envs,), num_objectives, dtype=jnp.int32
             )
-            q_state = initialize_high_level_q(
-                q_key,
-                observation,
-                completed,
-                current_node,
-                num_objectives,
-                config.hidden_size,
-                dynamic_config.learning_rate,
-            )
-            if dynamic_config.warmup_steps > 0:
-                objective, _ = choose_uniform_goals(goal_key, completed)
-            else:
-                objective, _ = choose_dynamic_goals(
-                    goal_key, observation, completed, current_node, q_state
+            if use_planner:
+                q_state = initialize_graph_planner(
+                    q_key, observation, completed, current_node,
+                    num_objectives, dynamic_config,
                 )
+                if dynamic_config.warmup_steps > 0:
+                    objective = choose_meta_controller_goals(
+                        goal_key, completed, current_node
+                    )
+                else:
+                    objective, _ = choose_graph_goals(
+                        goal_key, observation, completed, current_node,
+                        jnp.ones((config.num_envs,), dtype=bool), q_state,
+                    )
+            else:
+                q_state = initialize_high_level_q(
+                    q_key,
+                    observation,
+                    completed,
+                    current_node,
+                    num_objectives,
+                    config.hidden_size,
+                    dynamic_config.learning_rate,
+                )
+                if dynamic_config.warmup_steps > 0:
+                    objective, _ = choose_uniform_goals(goal_key, completed)
+                else:
+                    objective, _ = choose_dynamic_goals(
+                        goal_key, observation, completed, current_node, q_state
+                    )
             goal_state = GoalState(objective, completed, current_node)
             dynamic_state = DynamicTrainingState(
                 q_state=q_state,
@@ -392,9 +440,27 @@ def make_train(
                         dynamic_state.discounted_reward
                         + (config.gamma ** dynamic_state.duration) * reward
                     )
+                    in_warmup = (
+                        dynamic_state.global_env_steps < dynamic_config.warmup_steps
+                    )
                     option_done = high_level_option_done(
                         goal_done, duration, env_done, dynamic_config.goal_timeout
                     )
+                    replay_valid = option_done
+                    replay_success = goal_done
+                    if use_planner:
+                        # Warmup reproduces SEA exactly: a new goal on any newly
+                        # unlocked achievement and no option timeout.  Options cut
+                        # by a non-target event are censored, so they are not
+                        # used as graph labels; late successes count as timeouts.
+                        sea_done = env_done | goal_done | info["event_happened"]
+                        option_done = jnp.where(in_warmup, sea_done, option_done)
+                        replay_valid = option_done & (
+                            ~in_warmup | goal_done | env_done
+                        )
+                        replay_success = goal_done & (
+                            duration <= dynamic_config.goal_timeout
+                        )
                     replay = dynamic_state.replay.add(
                         HighLevelTransitionBatch(
                             observation=dynamic_state.start_observation,
@@ -407,9 +473,10 @@ def make_train(
                             next_current_node=transition_current_node,
                             duration=duration,
                             done=env_done,
-                            success=goal_done,
+                            success=replay_success,
+                            died=info["health_done"],
                         ),
-                        option_done,
+                        replay_valid,
                     )
                     global_env_steps = (
                         dynamic_state.global_env_steps + config.num_envs
@@ -418,31 +485,53 @@ def make_train(
                         global_env_steps < dynamic_config.warmup_steps
                     )
 
+                    no_overflow = jnp.zeros_like(option_done)
+
                     def select_new_goals(_):
                         def uniform(_):
-                            return choose_uniform_goals(
-                                goal_key, progress_state.completed
-                            )[0]
+                            if use_planner:
+                                goals = choose_meta_controller_goals(
+                                    goal_key,
+                                    progress_state.completed,
+                                    progress_state.last_completed,
+                                )
+                            else:
+                                goals = choose_uniform_goals(
+                                    goal_key, progress_state.completed
+                                )[0]
+                            return goals, no_overflow
 
                         def dynamic(_):
+                            if use_planner:
+                                return choose_graph_goals(
+                                    goal_key,
+                                    next_observation,
+                                    progress_state.completed,
+                                    progress_state.last_completed,
+                                    option_done,
+                                    dynamic_state.q_state,
+                                )
                             return choose_dynamic_goals(
                                 goal_key,
                                 next_observation,
                                 progress_state.completed,
                                 progress_state.last_completed,
                                 dynamic_state.q_state,
-                            )[0]
+                            )[0], no_overflow
 
                         return jax.lax.cond(
                             use_uniform, uniform, dynamic, operand=None
                         )
 
-                    selected = jax.lax.cond(
+                    selected, overflow = jax.lax.cond(
                         jnp.any(option_done),
                         select_new_goals,
-                        lambda _: goal_state.objective,
+                        lambda _: (goal_state.objective, no_overflow),
                         operand=None,
                     )
+                    selected_new = ~jnp.take_along_axis(
+                        progress_state.completed, selected[:, None], axis=1
+                    )[:, 0]
                     objective = jnp.where(
                         option_done, selected, goal_state.objective
                     )
@@ -471,6 +560,12 @@ def make_train(
                         global_env_steps=global_env_steps,
                     )
                     bootstrap_done = env_done | option_done
+                    if use_planner:
+                        # During warmup PPO bootstraps like SEA (exp. 1): only
+                        # target success or episode end are terminal.
+                        bootstrap_done = jnp.where(
+                            in_warmup, env_done | goal_done, bootstrap_done
+                        )
                     dynamic_step_metrics = DynamicStepMetrics(
                         ended=option_done,
                         success=goal_done,
@@ -479,6 +574,8 @@ def make_train(
                         uniform_selection=jnp.full(
                             option_done.shape, use_uniform
                         ),
+                        planner_overflow=overflow & option_done,
+                        selected_new=selected_new,
                     )
                 next_reset = (
                     bootstrap_done
@@ -568,16 +665,14 @@ def make_train(
                     0,
                 ).astype(jnp.int32)
                 zero = jnp.asarray(0.0, dtype=jnp.float32)
-                initial_q_metrics = {
-                    "full_q_loss": zero,
-                    "base_q_loss": zero,
-                    "full_q_mean": zero,
-                    "full_q_std": zero,
-                    "base_q_mean": zero,
-                    "base_q_std": zero,
-                    "q_residual_mean": zero,
-                    "q_residual_std": zero,
-                }
+                metric_names = (
+                    GRAPH_METRIC_NAMES if use_planner else (
+                        "full_q_loss", "base_q_loss", "full_q_mean",
+                        "full_q_std", "base_q_mean", "base_q_std",
+                        "q_residual_mean", "q_residual_std",
+                    )
+                )
+                initial_q_metrics = {name: zero for name in metric_names}
                 key, q_update_key = jax.random.split(key)
 
                 def q_update(_, loop_state):
@@ -586,18 +681,25 @@ def make_train(
                     batch = dynamic_state.replay.sample(
                         batch_key, dynamic_config.batch_size
                     )
-                    q_state, update_metrics = update_high_level_q(
-                        q_state,
-                        batch,
-                        goal_runtime.graph,
-                        goal_runtime.include_new_tasks,
-                        config.gamma,
-                        allow_unready_goals=dynamic_config.allow_unready_goals,
-                        allow_completed_goals=dynamic_config.allow_completed_goals,
-                        warmup=(
-                            dynamic_state.global_env_steps < dynamic_config.warmup_steps
-                        ),
-                    )
+                    if use_planner:
+                        q_state, update_metrics = update_graph_planner(
+                            q_state, batch, dynamic_config.model_target_ema,
+                            num_objectives,
+                        )
+                    else:
+                        q_state, update_metrics = update_high_level_q(
+                            q_state,
+                            batch,
+                            goal_runtime.graph,
+                            goal_runtime.include_new_tasks,
+                            config.gamma,
+                            allow_unready_goals=dynamic_config.allow_unready_goals,
+                            allow_completed_goals=dynamic_config.allow_completed_goals,
+                            warmup=(
+                                dynamic_state.global_env_steps
+                                < dynamic_config.warmup_steps
+                            ),
+                        )
                     metric_sums = jax.tree.map(
                         lambda total, value: total + value,
                         metric_sums,
@@ -776,6 +878,18 @@ def make_train(
                             dynamic_rollout.success.astype(jnp.float32).sum()
                             / denominator
                         ),
+                        "planner_overflow_fraction": (
+                            dynamic_rollout.planner_overflow.astype(
+                                jnp.float32
+                            ).sum()
+                            / denominator
+                        ),
+                        "selected_new_goal_fraction": (
+                            (dynamic_rollout.selected_new & ended)
+                            .astype(jnp.float32)
+                            .sum()
+                            / denominator
+                        ),
                         "mean_high_level_duration": (
                             (
                                 dynamic_rollout.duration
@@ -792,7 +906,17 @@ def make_train(
                 )
 
                 checkpoint_params = train_state.params
-                if dynamic_config is not None:
+                if use_planner:
+                    checkpoint_params = {
+                        "policy": train_state.params,
+                        "option_model": (
+                            dynamic_state.q_state.train_state.params
+                        ),
+                        "option_model_target": (
+                            dynamic_state.q_state.target_params
+                        ),
+                    }
+                elif dynamic_config is not None:
                     checkpoint_params = {
                         "policy": train_state.params,
                         "full_q": dynamic_state.q_state.full_q.params,

@@ -50,6 +50,19 @@ class DynamicGraphConfig:
     allow_completed_goals: bool = False
     structural_prior_weight: float = 1.0
     score_source: str = "residual"
+    # "residual": legacy Q_F-Q_B selector.  "graph-planner": supervised option
+    # model (state-conditioned edges) + K-hop planner; warmup uses SEA's
+    # meta-controller instead of uniform ready goals.
+    controller: str = "residual"
+    planner_horizon: int = 3
+    planner_leaf: bool = True
+    planner_beam_width: int = 4
+    planner_max_decisions: int = 128
+    planner_gamma: float = 0.99
+    planner_temperature: float = 0.1
+    model_hidden_size: int = 256
+    model_latent_size: int = 128
+    model_target_ema: float = 0.995
 
     def validate(self): 
         # TODO 이거 정리할 수 있으면 하기;
@@ -80,6 +93,18 @@ class DynamicGraphConfig:
             )
         if self.goal_timeout < 1:
             raise ValueError("high-level goal timeout must be positive")
+        if self.controller not in ("residual", "graph-planner"):
+            raise ValueError("controller must be residual or graph-planner")
+        if self.planner_horizon < 1 or self.planner_beam_width < 1:
+            raise ValueError("planner horizon and beam width must be positive")
+        if self.planner_max_decisions < 1:
+            raise ValueError("planner max decisions must be positive")
+        if not 0 < self.planner_gamma <= 1:
+            raise ValueError("planner gamma must be in (0, 1]")
+        if not np.isfinite(self.planner_temperature) or self.planner_temperature <= 0:
+            raise ValueError("planner temperature must be positive")
+        if not 0 <= self.model_target_ema < 1:
+            raise ValueError("model target EMA must be in [0, 1)")
 
 
 class HighLevelTransitionBatch(NamedTuple):
@@ -94,6 +119,7 @@ class HighLevelTransitionBatch(NamedTuple):
     duration: jax.Array
     done: jax.Array
     success: jax.Array
+    died: jax.Array | bool = False
 
 
 @struct.dataclass
@@ -111,6 +137,7 @@ class HighLevelReplayBuffer:
     duration: jax.Array
     done: jax.Array
     success: jax.Array
+    died: jax.Array
     position: jax.Array
     size: jax.Array
 
@@ -131,6 +158,7 @@ class HighLevelReplayBuffer:
             duration=jnp.zeros((capacity,), dtype=jnp.int32),
             done=jnp.zeros((capacity,), dtype=bool),
             success=jnp.zeros((capacity,), dtype=bool),
+            died=jnp.zeros((capacity,), dtype=bool),
             position=jnp.asarray(0, dtype=jnp.int32),
             size=jnp.asarray(0, dtype=jnp.int32),
         )
@@ -171,6 +199,10 @@ class HighLevelReplayBuffer:
             duration=append(self.duration, transition.duration),
             done=append(self.done, transition.done),
             success=append(self.success, transition.success),
+            died=append(
+                self.died,
+                jnp.broadcast_to(jnp.asarray(transition.died), valid.shape),
+            ),
             position=(self.position + count) % self.capacity,
             size=jnp.minimum(self.size + count, self.capacity),
         )
@@ -191,6 +223,7 @@ class HighLevelReplayBuffer:
             duration=self.duration[indices],
             done=self.done[indices],
             success=self.success[indices],
+            died=self.died[indices],
         )
 
 
