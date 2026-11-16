@@ -22,9 +22,17 @@ from craftax.sea.discovery import (
     fit_clusters,
     summarize_cluster_achievements,
 )
-from craftax.sea.env import make_sea_craftax_classic_env
-from craftax.sea.goal import GoalRuntime
-from craftax.sea.metrics import summarize_training_metrics
+from craftax.sea.env import (
+    COMBAT_MODES,
+    default_idle_timeout,
+    make_sea_craftax_classic_env,
+)
+from craftax.sea.goal import GoalRuntime, load_oracle_graph
+from craftax.sea.metrics import (
+    ACHIEVEMENT_NAMES,
+    crafter_score_from_rates,
+    summarize_training_metrics,
+)
 from craftax.sea.ppo_rnn import PPOConfig, make_train
 from craftax.sea.rollout import iter_policy_transitions
 from craftax.sea.streaming_discovery import collect_clustering_dataset, train_streaming_encoder
@@ -38,6 +46,94 @@ def _save_metric_summary(path, metrics):
     summary = summarize_training_metrics(metrics)
     path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+class WandbLogger:
+    """Log windowed PPO metrics, including the 22-achievement Crafter score.
+
+    PPO updates contain few finished episodes, so achievement counts are summed
+    over ``log_interval`` updates before success rates and the Crafter score
+    are computed.
+    """
+
+    _COUNT_KEYS = (
+        "achievement_success_count",
+        "episode_count",
+        "episode_return_sum",
+        "episode_length_sum",
+    )
+    # Per-update ratios that are meaningless when averaged over updates.
+    _SKIP_KEYS = (
+        "mean_episode_return",
+        "mean_episode_length",
+        "easy_success_rate",
+        "hard_success_rate",
+        "crafter_score",
+    )
+
+    def __init__(self, args, config, output):
+        import wandb
+
+        self.wandb = wandb
+        self.interval = args.log_interval
+        self.run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name or output.name,
+            group=args.wandb_group,
+            mode=args.wandb_mode,
+            dir=str(output),
+            config=config,
+        )
+
+    def stage_callback(self, stage, ppo_config):
+        steps_per_update = ppo_config.num_envs * ppo_config.num_steps
+        total_updates = ppo_config.total_timesteps // steps_per_update
+        self.wandb.define_metric(f"{stage}/env_steps")
+        self.wandb.define_metric(f"{stage}/*", step_metric=f"{stage}/env_steps")
+        window = {}
+
+        def callback(update, metrics):
+            update = int(update)
+            for name, value in metrics.items():
+                if name in self._SKIP_KEYS:
+                    continue
+                value = np.asarray(value, dtype=np.float64)
+                window[name] = window.get(name, 0.0) + value
+            window["_updates"] = window.get("_updates", 0) + 1
+            if update % self.interval and update != total_updates:
+                return
+            record = {f"{stage}/env_steps": update * steps_per_update,
+                      f"{stage}/update": update}
+            updates = window.pop("_updates")
+            counts = {key: window.pop(key) for key in self._COUNT_KEYS}
+            for name, value in window.items():
+                if value.ndim == 0:
+                    record[f"{stage}/{name}"] = float(value / updates)
+            window.clear()
+            episodes = float(counts["episode_count"])
+            record[f"{stage}/episodes_in_window"] = episodes
+            if episodes > 0:
+                rates = counts["achievement_success_count"] / episodes
+                record[f"{stage}/crafter_score"] = crafter_score_from_rates(rates)
+                record[f"{stage}/mean_episode_return"] = float(counts["episode_return_sum"] / episodes)
+                record[f"{stage}/mean_episode_length"] = float(counts["episode_length_sum"] / episodes)
+                for name, rate in zip(ACHIEVEMENT_NAMES, rates):
+                    record[f"{stage}/achievements/{name}"] = 100.0 * float(rate)
+            self.wandb.log(record)
+
+        return callback
+
+    def log_summary(self, stage, summary):
+        for name, value in summary.items():
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    self.run.summary[f"{stage}/final/{name}/{key}"] = item
+            else:
+                self.run.summary[f"{stage}/final/{name}"] = value
+
+    def finish(self):
+        self.wandb.finish()
 
 
 def _progress_reporter(output, stage, config):
@@ -82,8 +178,6 @@ def _progress_reporter(output, stage, config):
 
 
 def run_pipeline(args):
-    train_policy = make_train
-    collect_stream = iter_policy_transitions
     if args.discovery_interactions <= 0:
         raise ValueError("--discovery-interactions must be positive")
     if args.contrast_interactions < 0:
@@ -102,13 +196,28 @@ def run_pipeline(args):
                          "set --discovery-interactions rather than repeating or dropping batches")
     if args.clustering_interactions < 1 or args.clustering_transitions < 2:
         raise ValueError("clustering requires a positive rollout budget and at least two transitions")
+    if args.idle_timeout is None:
+        args.idle_timeout = default_idle_timeout(args.mortal)
+    if args.oracle_graph:
+        if args.base_only or args.stop_after_clustering or args.base_policy_checkpoint:
+            raise ValueError("--oracle-graph trains only the goal policy; drop "
+                             "--base-only/--stop-after-clustering/--base-policy-checkpoint")
+        oracle_graph, oracle_ids = load_oracle_graph(args.oracle_graph)
+    if not 0.0 <= args.unknown_goal_prob <= 1.0:
+        raise ValueError("--unknown-goal-prob must be in [0, 1]")
+    if args.unknown_goal_prob == 0.0:
+        # A never-selected unknown goal is equivalent to no new-task objective.
+        args.no_new_tasks = True
     output = Path(args.output)
     if (output / "config.json").exists():
         raise FileExistsError(f"run already exists: {output}; use a new output directory")
     output.mkdir(parents=True, exist_ok=True)
     symbolic = not args.pixels
     env = make_sea_craftax_classic_env(
-        symbolic=symbolic, idle_timeout=args.idle_timeout
+        symbolic=symbolic,
+        idle_timeout=args.idle_timeout,
+        mortal=args.mortal,
+        combat=args.combat,
     )
     common_ppo = dict(
         num_envs=args.num_envs,
@@ -145,22 +254,83 @@ def run_pipeline(args):
         max_grad_norm=args.discovery_max_grad_norm,
     )
     goal_config = PPOConfig(total_timesteps=args.goal_timesteps, **common_ppo)
+    run_config = {
+        "args": vars(args),
+        "env_name": env.name,
+        "base_ppo": asdict(base_config),
+        "discovery": asdict(discovery_config),
+        "discovery_rollout": asdict(stream_config),
+        "discovery_mean_contrast_coefficient": discovery_config.mean_contrast_coefficient,
+        "goal_ppo": asdict(goal_config),
+    }
     (output / "config.json").write_text(
-        json.dumps(
-            {
-                "args": vars(args),
-                "base_ppo": asdict(base_config),
-                "discovery": asdict(discovery_config),
-                "discovery_rollout": asdict(stream_config),
-                "discovery_mean_contrast_coefficient": discovery_config.mean_contrast_coefficient,
-                "goal_ppo": asdict(goal_config),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+        json.dumps(run_config, indent=2), encoding="utf-8",
     )
+    logger = WandbLogger(args, run_config, output) if args.wandb else None
+    try:
+        _run_stages(args, env, output, logger, base_config, stream_config,
+                    discovery_config, goal_config,
+                    (oracle_graph, oracle_ids) if args.oracle_graph else None)
+    finally:
+        if logger is not None:
+            logger.finish()
 
+
+def _train_goal_policy(args, env, output, logger, goal_config, goal_runtime, started):
+    goal_result = jax.jit(
+        make_train(
+            goal_config,
+            env,
+            pixel=args.pixels,
+            goal_runtime=goal_runtime,
+            progress_callback=_progress_reporter(output, "goal", goal_config),
+            progress_interval=args.log_interval,
+            metrics_callback=(
+                None if logger is None else logger.stage_callback("goal", goal_config)
+            ),
+        )
+    )(jax.random.PRNGKey(args.seed + 3))
+    jax.block_until_ready(goal_result["metrics"]["loss"])
+    jax.effects_barrier()
+    save_params(output / "goal_policy.msgpack", goal_result["runner_state"][0].params)
+    goal_metrics = _save_metric_summary(
+        output / "goal_metrics.json", goal_result["metrics"]
+    )
+    if logger is not None:
+        logger.log_summary("goal", goal_metrics)
+    print(goal_metrics)
+    print(f"pipeline finished in {time.perf_counter() - started:.1f}s")
+
+
+def _run_stages(args, env, output, logger, base_config, stream_config,
+                discovery_config, goal_config, oracle):
+    train_policy = make_train
+    collect_stream = iter_policy_transitions
     started = time.perf_counter()
+    goal_options = dict(
+        target_reward=args.target_goal_reward,
+        nontarget_reward=args.nontarget_goal_reward,
+        include_new_tasks=not args.no_new_tasks,
+        allow_reselect=args.allow_goal_reselect,
+        unknown_goal_prob=args.unknown_goal_prob,
+    )
+    if oracle is not None:
+        graph, achievement_ids = oracle
+        print(f"[oracle] training goal PPO-RNN on {args.oracle_graph} "
+              f"({len(achievement_ids)} nodes, {int(graph.sum())} edges); "
+              "base policy and discovery are skipped")
+        goal_runtime = GoalRuntime(
+            transition_network=None,
+            transition_params=None,
+            centroids=None,
+            threshold=None,
+            graph=jnp.asarray(graph),
+            oracle_achievement_ids=achievement_ids,
+            **goal_options,
+        )
+        _train_goal_policy(args, env, output, logger, goal_config, goal_runtime, started)
+        return
+
     if args.base_policy_checkpoint:
         checkpoint = Path(args.base_policy_checkpoint).resolve()
         print(f"[1/5] reusing frozen collection policy: {checkpoint}")
@@ -175,6 +345,9 @@ def run_pipeline(args):
             base_config, env, pixel=args.pixels,
             progress_callback=_progress_reporter(output, "base", base_config),
             progress_interval=args.log_interval,
+            metrics_callback=(
+                None if logger is None else logger.stage_callback("base", base_config)
+            ),
         ))(
             jax.random.PRNGKey(args.seed)
         )
@@ -185,6 +358,8 @@ def run_pipeline(args):
         base_metrics = _save_metric_summary(
             output / "base_metrics.json", base_result["metrics"]
         )
+        if logger is not None:
+            logger.log_summary("base", base_metrics)
         print(base_metrics)
 
     if args.base_only:
@@ -274,27 +449,9 @@ def run_pipeline(args):
         centroids=jnp.asarray(artifacts.centroids),
         threshold=artifacts.threshold,
         graph=jnp.asarray(artifacts.graph),
-        exploration_reward_coefficient=args.exploration_reward_coefficient,
-        include_new_tasks=not args.no_new_tasks,
+        **goal_options,
     )
-    goal_result = jax.jit(
-        train_policy(
-            goal_config,
-            env,
-            pixel=args.pixels,
-            goal_runtime=goal_runtime,
-            progress_callback=_progress_reporter(output, "goal", goal_config),
-            progress_interval=args.log_interval,
-        )
-    )(jax.random.PRNGKey(args.seed + 3))
-    jax.block_until_ready(goal_result["metrics"]["loss"])
-    jax.effects_barrier()
-    save_params(output / "goal_policy.msgpack", goal_result["runner_state"][0].params)
-    goal_metrics = _save_metric_summary(
-        output / "goal_metrics.json", goal_result["metrics"]
-    )
-    print(goal_metrics)
-    print(f"pipeline finished in {time.perf_counter() - started:.1f}s")
+    _train_goal_policy(args, env, output, logger, goal_config, goal_runtime, started)
 
 
 def build_parser():
@@ -319,7 +476,25 @@ def build_parser():
     parser.add_argument("--base-policy-checkpoint", help="reuse a saved collection policy and skip base PPO training")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=50)
-    parser.add_argument("--idle-timeout", type=int, default=100)
+    parser.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=None,
+        help="steps without a new achievement before the episode ends "
+             "(default: 100, or 10000 with --mortal)",
+    )
+    parser.add_argument(
+        "--mortal",
+        action="store_true",
+        help="use vanilla Craftax health: the player can die (health <= 0 or lava ends the episode)",
+    )
+    parser.add_argument(
+        "--combat",
+        choices=COMBAT_MODES,
+        default="sea",
+        help="sea: a hit only damages a creature if it is lethal (cow/skeleton/zombie hp 2/3/5); "
+             "org: vanilla Craftax accumulated damage and creature hp (3/3/5)",
+    )
     parser.add_argument("--base-timesteps", type=int, default=200_000_000)
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--discovery-interactions", type=int, default=50_000_000)
@@ -360,8 +535,31 @@ def build_parser():
     parser.add_argument("--discovery-max-grad-norm", type=float, default=1.0)
     parser.add_argument("--min-clusters", type=int)
     parser.add_argument("--max-clusters", type=int, default=30)
-    parser.add_argument("--exploration-reward-coefficient", type=float, default=0.1)
+    parser.add_argument("--target-goal-reward", type=float, default=3.0,
+                        help="goal-PPO reward for achieving the current target goal")
+    parser.add_argument("--nontarget-goal-reward", type=float, default=1.0,
+                        help="goal-PPO reward per first-time unlock of a non-target achievement")
+    parser.add_argument("--allow-goal-reselect", action="store_true",
+                        help="let the goal selector pick goals that were already achieved "
+                             "in the episode; completion then counts repeated events")
     parser.add_argument("--no-new-tasks", action="store_true")
+    parser.add_argument(
+        "--unknown-goal-prob", type=float, default=0.4,
+        help="probability of selecting the unknown/new-task goal (SEA default 0.4; "
+             "0 disables it). With --oracle-graph it is achieved by any first-time unlock",
+    )
+    parser.add_argument(
+        "--oracle-graph",
+        help="oracle achievement graph (.npz with graph/achievement_ids, e.g. "
+             "craftax_classic_22.npz); goals are true achievements, base policy "
+             "and discovery are skipped",
+    )
+    parser.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
+    parser.add_argument("--wandb-project", default="craftax-sea")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-name", help="run name (default: output directory name)")
+    parser.add_argument("--wandb-group")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
     parser.add_argument(
         "--stop-after-clustering",
         action="store_true",

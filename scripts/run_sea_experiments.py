@@ -1,4 +1,8 @@
-"""Run independent SEA seeds on dedicated GPUs and retain execution records."""
+"""Run independent SEA seeds on dedicated GPUs and retain execution records.
+
+Unrecognized options are forwarded to ``craftax.sea.train``, e.g.
+``--symbolic-debug --mortal --combat org --oracle-graph craftax_classic_22.npz --wandb``.
+"""
 
 import argparse
 import json
@@ -25,9 +29,28 @@ def main():
     parser.add_argument("--gpus", nargs="+", type=int, default=[0, 1])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1])
     parser.add_argument("--base-only", action="store_true")
-    args = parser.parse_args()
-    if len(args.gpus) != len(args.seeds) or len(set(args.gpus)) != len(args.gpus):
-        parser.error("provide one distinct GPU per seed")
+    parser.add_argument("--mem-fraction", type=float, default=0.90,
+                        help="XLA_PYTHON_CLIENT_MEM_FRACTION per run; lower it when runs share a GPU")
+    args, train_args = parser.parse_known_args()
+    for forbidden in ("--seed", "--output", "--base-only", "--base-policy-checkpoint"):
+        if any(arg == forbidden or arg.startswith(forbidden + "=") for arg in train_args):
+            parser.error(f"{forbidden} is managed by this launcher")
+    if "--oracle-graph" in train_args or any(a.startswith("--oracle-graph=") for a in train_args):
+        if args.base_only or args.base_run_root:
+            parser.error("--oracle-graph trains only the goal policy")
+        # Resolve now: training runs from a copied source tree.
+        for index, arg in enumerate(train_args):
+            if arg == "--oracle-graph" and index + 1 < len(train_args):
+                train_args[index + 1] = str(Path(train_args[index + 1]).resolve())
+            elif arg.startswith("--oracle-graph="):
+                train_args[index] = "--oracle-graph=" + str(Path(arg.split("=", 1)[1]).resolve())
+    if len(args.gpus) == 1:
+        # All seeds share one GPU; size --mem-fraction accordingly.
+        args.gpus = args.gpus * len(args.seeds)
+    if len(args.gpus) != len(args.seeds):
+        parser.error("provide one GPU per seed, or a single GPU shared by all seeds")
+    if args.mem_fraction * max(args.gpus.count(g) for g in args.gpus) > 0.95:
+        parser.error("--mem-fraction too large for the runs sharing a GPU")
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("seeds must be distinct")
 
@@ -81,14 +104,20 @@ def main():
             run_output.mkdir()
             env = os.environ.copy()
             env.update({"CUDA_VISIBLE_DEVICES": str(gpu), "JAX_PLATFORMS": "cuda,cpu",
-                        "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.90",
+                        "XLA_PYTHON_CLIENT_MEM_FRACTION": str(args.mem_fraction),
                         "OMP_NUM_THREADS": "8", "OPENBLAS_NUM_THREADS": "1",
                         "MKL_NUM_THREADS": "1", "PYTHONUNBUFFERED": "1"})
             env.pop("LD_LIBRARY_PATH", None)
             env.pop("PYTHONPATH", None)
-            command = [sys.executable, "-u", "-m", "craftax.sea.train", "--pixels",
+            observation = [] if "--symbolic-debug" in train_args else ["--pixels"]
+            command = [sys.executable, "-u", "-m", "craftax.sea.train", *observation,
                        "--seed", str(seed), "--log-interval", "10",
-                       "--output", str(run_output)]
+                       "--output", str(run_output), *train_args]
+            if "--wandb" in train_args:
+                if not any(a.startswith("--wandb-group") for a in train_args):
+                    command += ["--wandb-group", output.name]
+                if not any(a.startswith("--wandb-name") for a in train_args):
+                    command += ["--wandb-name", f"{output.name}-seed-{seed}"]
             if args.base_only:
                 command += ["--base-only"]
             if args.base_run_root:
@@ -120,7 +149,8 @@ def main():
                     folder = Path(record["output"])
                     results[str(record["seed"])] = {
                         stage: json.loads((folder / f"{stage}_metrics.json").read_text())
-                        for stage in (("base",) if args.base_only else ("base", "goal"))
+                        for stage in ("base", "goal")
+                        if (folder / f"{stage}_metrics.json").exists()
                     }
                 write_json(output / "results.json", results)
                 break

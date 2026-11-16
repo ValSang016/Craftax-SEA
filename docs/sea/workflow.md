@@ -36,7 +36,8 @@ clustering 표본 10k events → goal PPO 300M. 원본 actor 수와 `num_envs`�
 
 - 정책 성능: seed별 완료 episode 합계에서 성공률 계산, 그 뒤 seed 동일 가중 평균
 - last100: 마지막 100 update, 일반 full run에서 6,553,600 step
-- score21: eat_plant 제외 geometric score
+- crafter_score: 22개 achievement 전체 geometric score (학습 코드·wandb 기준)
+- score21: eat_plant 제외 geometric score (과거 분석용)
 - hard4: zombie, diamond, iron pickaxe, iron sword
 - unknown5: 위 4개 + eat_plant (oracle에서만 미발견 목표 집합)
 - encoder 로그: 1/500/.../마지막 update의 단일 update 값; 구간 평균 아님

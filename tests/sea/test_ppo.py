@@ -1,3 +1,4 @@
+import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -37,6 +38,20 @@ def test_training_cli_defaults_to_pixels():
     assert defaults.discovery_batch_size == 2560
     assert defaults.discovery_num_envs == 32
     assert parser.parse_args(["--symbolic-debug"]).pixels is False
+    assert defaults.idle_timeout is None  # resolved to 100, or 10000 with --mortal
+    assert defaults.mortal is False
+    assert defaults.combat == "sea"
+    assert defaults.target_goal_reward == 3.0
+    assert defaults.nontarget_goal_reward == 1.0
+    assert defaults.allow_goal_reselect is False
+    assert defaults.oracle_graph is None
+    assert defaults.wandb is False
+    custom = parser.parse_args([
+        "--symbolic-debug", "--mortal", "--combat", "org", "--idle-timeout", "500",
+        "--allow-goal-reselect", "--oracle-graph", "craftax_classic_22.npz", "--wandb",
+    ])
+    assert (custom.mortal, custom.combat, custom.idle_timeout) == (True, "org", 500)
+    assert custom.allow_goal_reselect and custom.oracle_graph and custom.wandb
 
 
 def test_goal_boundary_cuts_gae_bootstrap():
@@ -201,3 +216,35 @@ def test_goal_conditioned_ppo_smoke_update_is_finite():
         jax.random.PRNGKey(10)
     )
     assert jnp.isfinite(result["metrics"]["loss"]).all()
+
+
+@pytest.mark.parametrize("allow_reselect", [False, True])
+def test_oracle_goal_ppo_smoke_update_is_finite(allow_reselect):
+    from craftax.sea.goal import load_oracle_graph
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "craftax_classic_22.npz"
+    graph, ids = load_oracle_graph(path)
+    env = make_sea_craftax_classic_env(symbolic=True, mortal=True, combat="org")
+    runtime = GoalRuntime(
+        transition_network=None,
+        transition_params=None,
+        centroids=None,
+        threshold=None,
+        graph=jnp.asarray(graph),
+        oracle_achievement_ids=ids,
+        include_new_tasks=False,
+        allow_reselect=allow_reselect,
+    )
+    config = PPOConfig(
+        total_timesteps=8, num_envs=2, num_steps=4, update_epochs=1,
+        num_minibatches=1, hidden_size=32, reset_ratio=1,
+    )
+    seen = []
+    result = jax.jit(make_train(
+        config, env, pixel=False, goal_runtime=runtime,
+        metrics_callback=lambda update, metrics: seen.append(int(update)),
+    ))(jax.random.PRNGKey(12))
+    jax.effects_barrier()
+    assert jnp.isfinite(result["metrics"]["loss"]).all()
+    assert seen == [1]

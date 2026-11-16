@@ -7,7 +7,11 @@ import numpy as np
 
 from craftax.craftax_classic.constants import Achievement
 
+# All 22 Craftax-Classic achievements (collect_sapling included); the Crafter
+# score below is always the geometric mean over these 22 success rates.
 ACHIEVEMENT_NAMES = tuple(achievement.name.lower() for achievement in Achievement)
+NUM_ACHIEVEMENTS = len(ACHIEVEMENT_NAMES)
+assert NUM_ACHIEVEMENTS == 22, NUM_ACHIEVEMENTS
 HARD_ACHIEVEMENT_NAMES = (
     "defeat_zombie",
     "collect_diamond",
@@ -27,6 +31,15 @@ EASY17_ACHIEVEMENT_INDICES = tuple(
     for index, name in enumerate(ACHIEVEMENT_NAMES)
     if index not in HARD_ACHIEVEMENT_INDICES and name != "eat_plant"
 )
+
+
+def crafter_score_from_rates(rates):
+    """Crafter score: exp(mean(log(1 + 100 * rate))) - 1 over all 22 achievements."""
+
+    rates = np.asarray(rates, dtype=np.float64)
+    if rates.shape != (NUM_ACHIEVEMENTS,):
+        raise ValueError(f"expected {NUM_ACHIEVEMENTS} success rates, got {rates.shape}")
+    return float(np.exp(np.log1p(100.0 * rates).mean()) - 1.0)
 
 
 def rollout_episode_metrics(transitions):
@@ -95,7 +108,7 @@ def summarize_training_metrics(metrics):
             ),
             "easy_success_rate": float(rates[list(EASY_ACHIEVEMENT_INDICES)].mean()),
             "hard_success_rate": float(rates[list(HARD_ACHIEVEMENT_INDICES)].mean()),
-            "crafter_score": float(np.exp(np.log1p(100.0 * rates).mean()) - 1.0),
+            "crafter_score": crafter_score_from_rates(rates),
             "achievement_success_rate": {
                 name: float(rate) for name, rate in zip(ACHIEVEMENT_NAMES, rates)
             },
@@ -110,6 +123,8 @@ def summarize_training_metrics(metrics):
 
 __all__ = [
     "ACHIEVEMENT_NAMES",
+    "NUM_ACHIEVEMENTS",
+    "crafter_score_from_rates",
     "EASY_ACHIEVEMENT_INDICES",
     "EASY17_ACHIEVEMENT_INDICES",
     "HARD_ACHIEVEMENT_INDICES",

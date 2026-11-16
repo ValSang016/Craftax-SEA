@@ -2,12 +2,20 @@
 
 This module reproduces the non-vanilla Crafter settings from the SEA codebase:
 
-* the player is immortal and health is always nine;
-* lava and health do not terminate the episode;
+* the player is immortal and health is always nine (``mortal=False``,
+  default); with ``mortal=True`` the vanilla Craftax health dynamics apply
+  and death (health <= 0) or standing in lava terminates the episode;
+* otherwise lava and health do not terminate the episode;
 * an episode ends after 100 steps without a newly unlocked achievement;
 * reward is the number of newly unlocked achievements (no health shaping);
-* creatures only take damage when the current hit is lethal; and
-* cow, skeleton and zombie health are 2, 3 and 5 respectively.
+* creatures only take damage when the current hit is lethal and cow,
+  skeleton and zombie health are 2, 3 and 5 (``combat="sea"``, default); with
+  ``combat="org"`` damage accumulates as in vanilla Craftax and the vanilla
+  creature health (cow 3, skeleton 3, zombie 5) is used.
+
+``info["achievement_events"]`` marks every achievement event of a step,
+including repeats of an already unlocked achievement, whereas
+``info["new_achievements"]`` only marks first unlocks within the episode.
 
 The environment never auto-resets.  This is important for SEA because the
 transition encoder must see the true terminal observation before a reset.
@@ -22,7 +30,12 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from craftax.craftax_classic.constants import DIRECTIONS, Achievement, Action
+from craftax.craftax_classic.constants import (
+    DIRECTIONS,
+    Achievement,
+    Action,
+    BlockType,
+)
 from craftax.craftax_classic.envs.common import compute_score
 from craftax.craftax_classic.envs.craftax_pixels_env import (
     CraftaxClassicPixelsEnvNoAutoReset,
@@ -34,6 +47,11 @@ from craftax.craftax_classic.envs.craftax_symbolic_env import (
 from craftax.craftax_classic.game_logic import craftax_step, get_player_attack_damage
 from craftax.environment_base import spaces
 from craftax.environment_base.environment_bases import EnvironmentNoAutoReset
+
+
+COMBAT_MODES = ("sea", "org")
+IMMORTAL_IDLE_TIMEOUT = 100
+MORTAL_IDLE_TIMEOUT = 10_000
 
 
 @struct.dataclass
@@ -113,11 +131,21 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
     def __init__(
         self,
         symbolic: bool = True,
-        idle_timeout: int = 100,
+        idle_timeout: Optional[int] = None,
         static_env_params=None,
+        mortal: bool = False,
+        combat: str = "sea",
     ):
         super().__init__()
+        if combat not in COMBAT_MODES:
+            raise ValueError(f"combat must be one of {COMBAT_MODES}, got {combat!r}")
+        self.combat = combat
         self.symbolic = symbolic
+        self.mortal = bool(mortal)
+        if idle_timeout is None:
+            idle_timeout = default_idle_timeout(self.mortal)
+        if int(idle_timeout) < 1:
+            raise ValueError("idle_timeout must be positive")
         self.idle_timeout = int(idle_timeout)
         base_cls = (
             CraftaxClassicSymbolicEnvNoAutoReset
@@ -129,6 +157,9 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
 
     @property
     def default_params(self) -> EnvParams:
+        if self.combat == "org":
+            # Vanilla Craftax-Classic creature health (cow=3, skeleton=3, zombie=5).
+            return EnvParams()
         # SEA's non-vanilla Crafter uses cow=2, skeleton=3 and zombie=5.
         return EnvParams(cow_health=2, skeleton_health=3, zombie_health=5)
 
@@ -140,15 +171,34 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         params: EnvParams,
     ) -> Tuple[jax.Array, SeaEnvState, float, bool, dict]:
         old_state = state.env_state
+        # Craftax only ORs achievement flags and never reads them for game
+        # logic.  Stepping with cleared flags therefore yields exactly the
+        # achievement events of this step, including repeated events.
+        cleared = old_state.replace(
+            achievements=jnp.zeros_like(old_state.achievements)
+        )
         stepped_state, _ = craftax_step(
-            key, old_state, action, params, self.static_env_params
+            key, cleared, action, params, self.static_env_params
+        )
+        achievement_events = stepped_state.achievements
+        stepped_state = stepped_state.replace(
+            achievements=old_state.achievements | achievement_events
         )
 
-        stepped_state = _restore_nonlethal_mob_damage(old_state, stepped_state, action)
+        if self.combat == "sea":
+            stepped_state = _restore_nonlethal_mob_damage(
+                old_state, stepped_state, action
+            )
         # The original immortal setter immediately writes health=9.  Restore it
         # before rendering so neither symbolic nor pixel observations expose a
-        # transient death state.
-        stepped_state = _restore_immortal_player(old_state, stepped_state)
+        # transient death state.  Mortal mode keeps vanilla Craftax health.
+        if not self.mortal:
+            stepped_state = _restore_immortal_player(old_state, stepped_state)
+            # A hurt wake-up that the immortal setter undid is not an event.
+            wake_index = Achievement.WAKE_UP.value
+            achievement_events = achievement_events.at[wake_index].set(
+                achievement_events[wake_index] & ~stepped_state.is_sleeping
+            )
 
         new_achievements = stepped_state.achievements & ~old_state.achievements
         event_count = new_achievements.astype(jnp.float32).sum()
@@ -157,7 +207,8 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
 
         idle_done = idle_steps >= self.idle_timeout
         time_done = stepped_state.timestep >= params.max_timesteps
-        done = idle_done | time_done
+        death_done = self._death_done(stepped_state)
+        done = idle_done | time_done | death_done
         new_state = SeaEnvState(stepped_state, idle_steps)
 
         info = compute_score(stepped_state, done)
@@ -167,6 +218,7 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
                 "event_count": event_count,
                 "event_happened": event_happened,
                 "new_achievements": new_achievements,
+                "achievement_events": achievement_events,
                 # The vector wrapper resets immediately after this call.  Keep
                 # terminal episode state in info so PPO can aggregate the same
                 # per-episode metrics as SEA's CrafterMonitorWrapper.
@@ -175,6 +227,7 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
                 "idle_steps": idle_steps,
                 "idle_done": idle_done,
                 "time_done": time_done,
+                "death_done": death_done,
             }
         )
 
@@ -197,15 +250,29 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
     def get_obs(self, state: SeaEnvState) -> jax.Array:
         return self._base_env.get_obs(state.env_state)
 
+    def _death_done(self, state: EnvState) -> jax.Array:
+        """Vanilla Craftax death: health <= 0 or standing in lava."""
+        if not self.mortal:
+            return jnp.array(False)
+        in_lava = (
+            state.map[state.player_position[0], state.player_position[1]]
+            == BlockType.LAVA.value
+        )
+        return (state.player_health <= 0) | in_lava
+
     def is_terminal(self, state: SeaEnvState, params: EnvParams) -> bool:
-        return (state.idle_steps >= self.idle_timeout) | (
-            state.env_state.timestep >= params.max_timesteps
+        return (
+            (state.idle_steps >= self.idle_timeout)
+            | (state.env_state.timestep >= params.max_timesteps)
+            | self._death_done(state.env_state)
         )
 
     @property
     def name(self) -> str:
         mode = "Symbolic" if self.symbolic else "Pixels"
-        return f"Craftax-Classic-SEA-{mode}-NoAutoReset-v1"
+        mortality = "-Mortal" if self.mortal else ""
+        combat = "-CombatOrg" if self.combat == "org" else ""
+        return f"Craftax-Classic-SEA{mortality}{combat}-{mode}-NoAutoReset-v1"
 
     @property
     def num_actions(self) -> int:
@@ -218,14 +285,28 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         return self._base_env.observation_space(params or self.default_params)
 
 
+def default_idle_timeout(mortal: bool) -> int:
+    """Idle timeout used when none is given: 100 immortal, 10000 mortal."""
+    return MORTAL_IDLE_TIMEOUT if mortal else IMMORTAL_IDLE_TIMEOUT
+
+
 def make_sea_craftax_classic_env(
-    symbolic: bool = True, idle_timeout: int = 100
+    symbolic: bool = True,
+    idle_timeout: Optional[int] = None,
+    mortal: bool = False,
+    combat: str = "sea",
 ) -> SeaCraftaxClassicEnvNoAutoReset:
-    return SeaCraftaxClassicEnvNoAutoReset(symbolic=symbolic, idle_timeout=idle_timeout)
+    if idle_timeout is None:
+        idle_timeout = default_idle_timeout(mortal)
+    return SeaCraftaxClassicEnvNoAutoReset(
+        symbolic=symbolic, idle_timeout=idle_timeout, mortal=mortal, combat=combat
+    )
 
 
 __all__ = [
+    "COMBAT_MODES",
     "SeaCraftaxClassicEnvNoAutoReset",
+    "default_idle_timeout",
     "SeaEnvState",
     "_restore_immortal_player",
     "make_sea_craftax_classic_env",

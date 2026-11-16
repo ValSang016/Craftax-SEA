@@ -96,11 +96,16 @@ def calculate_gae(transitions, last_value, config: PPOConfig):
 def make_train(
     config: PPOConfig, env, *, pixel: bool = False, goal_runtime=None,
     progress_callback=None, progress_interval: int = 50,
+    metrics_callback=None,
 ):
     """Build a jittable base-policy PPO training function.
 
     Goal-conditioned reward and pseudo-terminal handling are layered on this
     same rollout format by :mod:`craftax.sea.goal_ppo`.
+
+    ``metrics_callback(update, metrics)`` (optional) is called on the host
+    after every update, e.g. for experiment trackers that aggregate episodes
+    across updates.
     """
 
     config.validate()
@@ -158,6 +163,8 @@ def make_train(
                 config.num_envs,
                 goal_runtime.graph,
                 goal_runtime.include_new_tasks,
+                goal_runtime.allow_reselect,
+                goal_runtime.unknown_goal_prob,
             )
 
         runner_state = (
@@ -225,7 +232,9 @@ def make_train(
                         env_done,
                         reward,
                         new_achievements=info["new_achievements"],
+                        achievement_events=info["achievement_events"],
                     )
+                goal_done = goal_done.astype(bool)
                 bootstrap_done = env_done | goal_done
                 next_reset = (
                     bootstrap_done
@@ -405,10 +414,14 @@ def make_train(
                 ).mean(),
             }
             metrics.update(rollout_episode_metrics(transitions))
-            if progress_callback is not None:
-                update_count = train_state.step // (
-                    config.update_epochs * config.num_minibatches
+            update_count = train_state.step // (
+                config.update_epochs * config.num_minibatches
+            )
+            if metrics_callback is not None:
+                jax.debug.callback(
+                    metrics_callback, update_count, metrics, ordered=True
                 )
+            if progress_callback is not None:
 
                 def report(_):
                     jax.debug.callback(

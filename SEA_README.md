@@ -11,15 +11,29 @@ adds SEA-specific modules under `craftax/sea`.
 
 ## Environment semantics
 
-- player health is always 9 (immortal);
-- lava and health never terminate an episode;
+Defaults (SEA's non-vanilla Crafter):
+
+- player health is always 9 (immortal); lava and health never terminate an episode;
 - 100 consecutive steps without a new achievement terminate the episode;
 - the 10,000-step hard limit remains;
-- reward is newly unlocked achievement count, with no health shaping;
-- creature damage is lethal-only and cannot accumulate; and
+- base reward is the newly unlocked achievement count, with no health shaping;
+- creature damage is lethal-only and cannot accumulate (`--combat sea`); and
 - cow, skeleton and zombie health are 2, 3 and 5.
 
+Options (`craftax.sea.train`, also forwarded by `scripts/run_sea_experiments.py`):
 
+| Option | Effect |
+|---|---|
+| `--mortal` | vanilla Craftax health; death (health <= 0) or lava ends the episode (`info["death_done"]`) |
+| `--idle-timeout N` | idle-step limit; default 100, or 10,000 with `--mortal` |
+| `--combat org` | vanilla accumulated creature damage and creature health (cow 3, skeleton 3, zombie 5) |
+| `--target-goal-reward` / `--nontarget-goal-reward` | goal-PPO reward: 3 for the current target goal, 1 per first-time non-target unlock (defaults) |
+| `--allow-goal-reselect` | goals achieved earlier in the episode can be selected again; completion counts repeated events (`info["achievement_events"]`) |
+| `--oracle-graph craftax_classic_22.npz` | goals are the true achievements with the given graph; base policy and discovery are skipped; the new-task goal is disabled when all 22 achievements are nodes |
+| `--wandb` (`--wandb-project`, `--wandb-entity`, `--wandb-name`, `--wandb-group`, `--wandb-mode`) | log PPO metrics, the 22-achievement Crafter score and per-achievement success rates to Weights & Biases |
+
+All metrics use all 22 Craftax-Classic achievements (`collect_sapling` included).
+Symbolic observations (`--symbolic-debug`) work for every stage, not only debugging.
 
 ## Quick smoke run
 
