@@ -27,6 +27,7 @@ from craftax.sea.dynamic_graph import DynamicGraphConfig
 from craftax.sea.env import make_sea_craftax_classic_env
 from craftax.sea.goal import GoalRuntime, load_oracle_graph
 from craftax.sea.metrics import (
+    ACHIEVEMENT_NAMES,
     EASY17_ACHIEVEMENT_INDICES,
     NO_EAT_PLANT_ACHIEVEMENT_INDICES,
     summarize_training_metrics,
@@ -34,6 +35,13 @@ from craftax.sea.metrics import (
 from craftax.sea.ppo_rnn import PPOConfig, make_train
 from craftax.sea.rollout import iter_policy_transitions
 from craftax.sea.streaming_discovery import collect_clustering_dataset, train_streaming_encoder
+
+
+EPISODE_METRIC_NAMES = frozenset({
+    "episode_count", "episode_return_sum", "episode_length_sum",
+    "mean_episode_return", "mean_episode_length", "achievement_success_count",
+    "easy_success_rate", "hard_success_rate", "crafter_score",
+})
 
 
 def _parse_bool(value):
@@ -74,8 +82,20 @@ class _WandbLogger:
     @staticmethod
     def _scalars(metrics):
         values = {}
+        # Episode statistics are per-update; with no finished episode they are
+        # placeholders (score 0), so omit them instead of plotting zeros.
+        has_episodes = int(np.asarray(metrics.get("episode_count", 1))) > 0
         for name, value in metrics.items():
+            if not has_episodes and name in EPISODE_METRIC_NAMES:
+                continue
             array = np.asarray(value)
+            if name == "achievement_success_count" and array.ndim == 1:
+                count = max(int(np.asarray(metrics["episode_count"])), 1)
+                values.update({
+                    f"achievement/{achievement}": float(successes) / count
+                    for achievement, successes in zip(ACHIEVEMENT_NAMES, array)
+                })
+                continue
             if array.ndim == 0:
                 values[name] = float(array)
             elif name == "selected_goal_distribution" and array.ndim == 1:

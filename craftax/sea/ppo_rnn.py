@@ -938,7 +938,10 @@ def make_train(
                 jax.lax.cond(
                     (update_count == 1)
                     | (update_count % progress_interval == 0)
-                    | (update_count == num_updates),
+                    | (update_count == num_updates)
+                    # Long episodes end in rare, synchronized bursts; always
+                    # report those updates so episode metrics are not missed.
+                    | (metrics["episode_count"] > 0),
                     report, lambda _: None, operand=None,
                 )
             return runner_state, metrics
