@@ -44,6 +44,10 @@ EPISODE_METRIC_NAMES = frozenset({
 })
 
 
+def _optional_float(value):
+    return None if value.lower() == "none" else float(value)
+
+
 def _parse_bool(value):
     normalized = value.lower()
     if normalized in {"true", "1", "yes"}:
@@ -739,9 +743,11 @@ def build_parser():
     )
     parser.add_argument(
         "--non-target-achievement-coefficient",
-        type=float,
+        type=_optional_float,
         default=1.0,
-        help="SEA non-target achievement reward scale; default: 1",
+        help="non-target achievement reward scale; default: 1. 'none' restores the "
+        "original SEA port: every new achievement (target included) earns "
+        "--exploration-reward-coefficient",
     )
     parser.add_argument(
         "--repeat-target-coefficient",

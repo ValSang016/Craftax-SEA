@@ -49,8 +49,8 @@ def parse_condition(token):
     e.g. K2-noleaf-r1, K2-leaf-r0-pleaf (prune only the out-degree),
     K2-leaf-r0-pall (also prune every hop by static prerequisites).
     """
-    if token == "sea":
-        return {"kind": "sea"}
+    if token in ("sea", "sea-orig"):
+        return {"kind": token}
     try:
         parts = token.split("-")
         horizon, leaf, repeat = parts[:3]
@@ -96,6 +96,17 @@ def build_jobs(args):
                     "exp1-sea-meta", seed,
                     ["--high-level-controller", "sea-meta-controller"],
                     ["exp1", "sea-meta"],
+                ))
+                continue
+            if condition["kind"] == "sea-orig":
+                # Original SEA port reward: target +1, every new achievement +0.1.
+                jobs.append(job(
+                    "exp1-sea-meta-origreward", seed,
+                    ["--high-level-controller", "sea-meta-controller",
+                     "--goal-success-coefficient", "1",
+                     "--non-target-achievement-coefficient", "none",
+                     "--exploration-reward-coefficient", "0.1"],
+                    ["exp1", "sea-meta", "orig-reward"],
                 ))
                 continue
             horizon, repeat = condition["horizon"], condition["repeat"]
