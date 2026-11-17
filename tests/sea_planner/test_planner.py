@@ -340,6 +340,7 @@ def test_cli_flags_reach_configs():
         "--non-target-achievement-coefficient", "1", "--repeat-target-coefficient", "0.5",
         "--dynamic-warmup-steps", "1000", "--health-reward-coef", "0.1",
         "--completed-prediction", "rule", "--model-decoder-hidden-size", "64",
+        "--planner-epsilon-start", "0.6", "--planner-epsilon-decay-steps", "500",
     ])
     _, planner = make_configs(args)
     assert (planner.planner_horizon, planner.planner_leaf, planner.planner_beam_width) == (3, False, 5)
@@ -349,6 +350,7 @@ def test_cli_flags_reach_configs():
     assert (planner.learning_rate, planner.replay_ratio, planner.goal_timeout) == (1e-4, 2.0, 200)
     assert not planner.allow_unready_goals and planner.allow_completed_goals == "false"
     assert planner.warmup_steps == 1000 and planner.planner_epsilon == 0.2
+    assert (planner.planner_epsilon_start, planner.planner_epsilon_decay_steps) == (0.6, 500)
     assert planner.completed_prediction == "rule" and planner.model_decoder_hidden_size == 64
     assert make_env(vars(args)).health_reward_coef == 0.1
     default = build_parser().parse_args(["--output", "unused"])
@@ -360,7 +362,9 @@ def test_cli_flags_reach_configs():
     assert env.mortal and env.combat == "org" and env.idle_timeout == 10_000 and env.symbolic
     _, planner = make_configs(defaults)
     assert planner.planner_horizon == 2 and planner.allow_completed_goals == "true"
-    assert planner.warmup_steps == 50_000_000
+    assert planner.warmup_steps == 0
+    assert (planner.planner_epsilon_start, planner.planner_epsilon,
+            planner.planner_epsilon_decay_steps) == (1.0, 0.2, 50_000_000)
 
 
 def _tiny(warmup_steps=0, goal_timeout=300, **planner_kwargs):
@@ -395,7 +399,8 @@ def test_ppo_transition_uses_the_goal_followed_in_that_step():
 
 
 def test_planner_epsilon_mixes_random_goals_after_warmup():
-    make_train, config, env, runtime, planner = _tiny(goal_timeout=1, planner_epsilon=0.5)
+    make_train, config, env, runtime, planner = _tiny(goal_timeout=1, planner_epsilon=0.5,
+                                                      planner_epsilon_start=0.5)
     result = jax.jit(make_train(config, env, runtime, planner, return_rollout=True))(
         jax.random.PRNGKey(3)
     )
@@ -405,6 +410,17 @@ def test_planner_epsilon_mixes_random_goals_after_warmup():
     assert not (explored & ~ended).any()
     assert 0.3 < explored[ended].mean() < 0.7
     assert float(np.asarray(result["metrics"]["planner_random_fraction"]).mean()) > 0.3
+
+
+def test_epsilon_decays_linearly_after_warmup():
+    config = PlannerConfig(warmup_steps=100, planner_epsilon_start=1.0, planner_epsilon=0.2,
+                           planner_epsilon_decay_steps=1000)
+    values = [float(config.epsilon_at(t)) for t in (0, 100, 600, 1100, 5000)]
+    np.testing.assert_allclose(values, [1.0, 1.0, 0.6, 0.2, 0.2], atol=1e-6)
+    constant = PlannerConfig(planner_epsilon_start=0.0, planner_epsilon=0.0)
+    assert not constant.explores
+    instant = PlannerConfig(planner_epsilon_decay_steps=0, planner_epsilon=0.3)
+    assert float(instant.epsilon_at(0)) == pytest.approx(0.3)
 
 
 def test_warmup_uses_meta_controller_and_censors_options():

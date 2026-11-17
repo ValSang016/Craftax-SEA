@@ -397,7 +397,7 @@ def epsilon_explore(key, goals, candidates, epsilon):
     Returns ``(goals, explored_mask)``.  Envs without any candidate keep
     their goal.
     """
-    if epsilon <= 0:
+    if isinstance(epsilon, (int, float)) and epsilon <= 0:
         return goals, jnp.zeros(goals.shape, dtype=bool)
     coin_key, goal_key = jax.random.split(key)
     explored = jax.random.uniform(coin_key, goals.shape) < epsilon

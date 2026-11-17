@@ -4,8 +4,8 @@
 Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore|-half][-e<eps>][-crule]``:
 K hops, leaf term on/off, repeat-target reward x, optional static prune, and
 ``nore`` = completed goals cannot be selected again, ``half`` = only
-eat_cow/collect_drink/eat_plant can be selected again, ``e<eps>`` = after
-warmup a uniform random candidate goal with probability eps, ``crule`` = the
+eat_cow/collect_drink/eat_plant can be selected again, ``e<eps>`` = final
+epsilon of the 1.0 -> eps decay (default 0.2), ``crule`` = the
 completed vector after a hop is c | onehot(goal) instead of F's prediction.  Jobs are queued seed by
 seed (every condition's seed 0, then seed 1, ...) and handed to the first free
 GPU slot.
@@ -47,7 +47,7 @@ def parse_condition(token):
             "repeat": float(repeat[1:]),
             "prune": "none",
             "reselect": "true",
-            "epsilon": 0.0,
+            "epsilon": None,
             "completed": "learned",
         }
         for extra in extras:
@@ -79,9 +79,8 @@ def condition_args(condition):
         "--repeat-target-coefficient", f"{condition['repeat']:g}",
         "--planner-prune", condition["prune"],
         "--reselection", condition["reselect"],
-        "--planner-epsilon", f"{condition['epsilon']:g}",
         "--completed-prediction", condition["completed"],
-    ]
+    ] + ([] if condition["epsilon"] is None else ["--planner-epsilon", f"{condition['epsilon']:g}"])
 
 
 def build_jobs(args):
@@ -134,10 +133,13 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--jobs-per-gpu", type=int, default=1)
+    parser.add_argument("--label", default="",
+                        help="suffix for manifest/status files so several supervisors share --output")
     parser.add_argument("--gpu-per-condition", action="store_true",
                         help="pin each condition to one GPU (condition i -> gpus[i %% len])")
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
-    parser.add_argument("--warmup-steps", type=int, default=50_000_000)
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                        help="oracle meta-controller warmup (default 0: planner from the start)")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--wandb-project", default="craftax-sea-planner")
@@ -160,7 +162,8 @@ def main():
 
     root = Path(args.output).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    write_json(root / "manifest.json", {
+    suffix = f"-{args.label}" if args.label else ""
+    write_json(root / f"manifest{suffix}.json", {
         "created": datetime.now().isoformat(timespec="seconds"),
         "argv": sys.argv,
         "jobs": jobs,
@@ -191,7 +194,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     def status():
-        write_json(root / "status.json", {
+        write_json(root / f"status{suffix}.json", {
             "updated": datetime.now().isoformat(timespec="seconds"),
             "supervisor_pid": os.getpid(),
             "jobs": [{k: job.get(k) for k in ("name", "state", "gpu", "pid", "returncode", "output")}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -12,7 +13,7 @@ class PlannerConfig:
     # Schedule: the existing SEA meta-controller picks goals for the first
     # ``warmup_steps`` env steps (the option model still learns), then only
     # the planner selects goals.
-    warmup_steps: int = 50_000_000
+    warmup_steps: int = 0
     # High-level replay of options and the supervised option-model update.
     replay_capacity: int = 100_000
     batch_size: int = 256
@@ -32,9 +33,13 @@ class PlannerConfig:
     planner_max_decisions: int = 128
     planner_gamma: float = 0.99
     planner_temperature: float = 0.1
-    # With this probability a newly chosen goal is replaced by a uniform draw
-    # from the candidate goals (exploration on top of the planner softmax).
-    planner_epsilon: float = 0.0
+    # With probability epsilon a newly chosen goal is replaced by a uniform
+    # draw from the candidate goals.  Epsilon decays linearly from
+    # ``planner_epsilon_start`` to ``planner_epsilon`` over
+    # ``planner_epsilon_decay_steps`` env steps after warmup, then stays.
+    planner_epsilon: float = 0.2
+    planner_epsilon_start: float = 1.0
+    planner_epsilon_decay_steps: int = 50_000_000
     planner_prune: str = "none"
     planner_prune_width: int = 13
     # Option model F.
@@ -47,6 +52,20 @@ class PlannerConfig:
     # c' = c | onehot(goal) (no completed head training).
     completed_prediction: str = "learned"
     model_target_ema: float = 0.995
+
+    def epsilon_at(self, env_steps):
+        """Exploration probability after ``env_steps`` total env steps."""
+        since = jnp.maximum(jnp.asarray(env_steps, jnp.float32) - self.warmup_steps, 0.0)
+        frac = jnp.clip(since / max(self.planner_epsilon_decay_steps, 1), 0.0, 1.0)
+        if self.planner_epsilon_decay_steps == 0:
+            frac = jnp.ones_like(frac)
+        return self.planner_epsilon_start + frac * (self.planner_epsilon - self.planner_epsilon_start)
+
+    @property
+    def explores(self):
+        return self.planner_epsilon > 0 or (
+            self.planner_epsilon_start > 0 and self.planner_epsilon_decay_steps > 0
+        )
 
     def validate(self):
         if self.warmup_steps < 0:
@@ -72,8 +91,10 @@ class PlannerConfig:
             raise ValueError("planner gamma must be in (0, 1]")
         if not np.isfinite(self.planner_temperature) or self.planner_temperature <= 0:
             raise ValueError("planner temperature must be positive")
-        if not 0 <= self.planner_epsilon <= 1:
-            raise ValueError("planner epsilon must be in [0, 1]")
+        if not (0 <= self.planner_epsilon <= 1 and 0 <= self.planner_epsilon_start <= 1):
+            raise ValueError("planner epsilon (start and final) must be in [0, 1]")
+        if self.planner_epsilon_decay_steps < 0:
+            raise ValueError("planner epsilon decay steps cannot be negative")
         if self.planner_prune not in ("none", "leaf", "all"):
             raise ValueError("planner prune must be none, leaf, or all")
         if self.planner_prune_width < 1:

@@ -134,14 +134,14 @@ def make_train(
         raise ValueError("planner and goal runtime disagree on goal reselection")
     reselectable = runtime.reselectable
 
-    def planner_goals(key, observation, completed, node, needs_goal, model):
+    def planner_goals(key, observation, completed, node, needs_goal, model, env_steps):
         candidates = get_goal_candidates(
             completed, graph,
             allow_unready_goals=planner_config.allow_unready_goals,
             allow_completed_goals=reselectable,
         )
         # Split only when exploring so epsilon=0 keeps the original RNG stream.
-        if planner_config.planner_epsilon > 0:
+        if planner_config.explores:
             plan_key, explore_key = jax.random.split(key)
         else:
             plan_key, explore_key = key, key
@@ -149,9 +149,8 @@ def make_train(
             plan_key, model, observation, completed, node, candidates, needs_goal,
             planner_config, graph=graph,
         )
-        goals, explored = epsilon_explore(
-            explore_key, goals, candidates, planner_config.planner_epsilon
-        )
+        epsilon = planner_config.epsilon_at(env_steps) if planner_config.explores else 0.0
+        goals, explored = epsilon_explore(explore_key, goals, candidates, epsilon)
         return goals, overflow, explored
 
     def train(key):
@@ -194,7 +193,7 @@ def make_train(
         else:
             objective, _, _ = planner_goals(
                 goal_key, observation, completed, node,
-                jnp.ones((config.num_envs,), dtype=bool), model,
+                jnp.ones((config.num_envs,), dtype=bool), model, 0,
             )
         goal_state = GoalState(objective, completed, node)
         planner_state = PlannerTrainingState(
@@ -281,7 +280,7 @@ def make_train(
                 def plan(_):
                     return planner_goals(
                         select_key, next_observation, progress.completed,
-                        progress.last_completed, option_done, planner_state.model,
+                        progress.last_completed, option_done, planner_state.model, env_steps,
                     )
 
                 return jax.lax.cond(select_warmup, warmup, plan, operand=None)
@@ -492,6 +491,10 @@ def make_train(
                     (options.duration * ended).astype(jnp.float32).sum() / per_option
                 ),
                 "env_steps": planner_state.env_steps,
+                "planner_epsilon": jnp.where(
+                    planner_state.env_steps < planner_config.warmup_steps, 0.0,
+                    planner_config.epsilon_at(planner_state.env_steps),
+                ),
             }
             metrics.update(episode_metrics(transitions))
 

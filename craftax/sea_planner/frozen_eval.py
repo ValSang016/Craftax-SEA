@@ -58,7 +58,7 @@ def _planner_evaluator(run_dir, config, num_envs, updates, num_steps):
     planner = PlannerConfig(**{"model_decoder_hidden_size": 256, **config["planner"]})
     # No warmup: the planner selects every goal.  The replay is never sampled.
     planner = replace(
-        planner, warmup_steps=0, planner_epsilon=0.0, replay_capacity=planner.batch_size,
+        planner, warmup_steps=0, planner_epsilon=0.0, planner_epsilon_start=0.0, replay_capacity=planner.batch_size,
         min_replay_size=planner.batch_size,
     )
     ppo = PPOConfig(**config["goal_ppo"])

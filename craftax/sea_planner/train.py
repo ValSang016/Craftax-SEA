@@ -3,8 +3,9 @@
     python -m craftax.sea_planner.train --output runs/planner/K2-leaf-r0/seed-0 --seed 0
 
 Defaults are the experiment setting: symbolic, mortal, vanilla (cumulative)
-combat, idle timeout 10000, oracle 22-achievement graph, 300M env steps with a
-50M SEA meta-controller warmup.
+combat, idle timeout 10000, 22 achievement nodes, 300M env steps.  The
+planner picks goals from the start (no oracle-graph warmup) with epsilon
+decaying linearly 1.0 -> 0.2 over the first 50M steps.
 """
 
 from __future__ import annotations
@@ -107,15 +108,21 @@ def build_parser():
     # High-level controller.
     parser.add_argument("--high-level-controller", choices=("graph-planner",),
                         default="graph-planner")
-    parser.add_argument("--dynamic-warmup-steps", type=int, default=50_000_000)
+    parser.add_argument("--dynamic-warmup-steps", type=int, default=0,
+                        help="env steps with the oracle-graph SEA meta-controller before the "
+                             "planner (default 0: planner from the start)")
     parser.add_argument("--planner-horizon", type=int, default=2)
     parser.add_argument("--planner-leaf", type=parse_bool, default=True, metavar="BOOL")
     parser.add_argument("--planner-beam-width", type=int, default=4)
     parser.add_argument("--planner-max-decisions", type=int, default=128)
     parser.add_argument("--planner-gamma", type=float, default=0.99)
     parser.add_argument("--planner-temperature", type=float, default=0.1)
-    parser.add_argument("--planner-epsilon", type=float, default=0.0,
-                        help="after warmup, probability of a uniform random candidate goal")
+    parser.add_argument("--planner-epsilon", type=float, default=0.2,
+                        help="final probability of a uniform random candidate goal")
+    parser.add_argument("--planner-epsilon-start", type=float, default=1.0,
+                        help="epsilon right after warmup; decays linearly to --planner-epsilon")
+    parser.add_argument("--planner-epsilon-decay-steps", type=int, default=50_000_000,
+                        help="env steps of the linear epsilon decay (0: final value at once)")
     parser.add_argument("--planner-prune", choices=("none", "leaf", "all"), default="none")
     parser.add_argument("--planner-prune-width", type=int, default=13)
     parser.add_argument("--model-hidden-size", type=int, default=256)
@@ -183,6 +190,8 @@ def make_configs(args):
         planner_gamma=args.planner_gamma,
         planner_temperature=args.planner_temperature,
         planner_epsilon=args.planner_epsilon,
+        planner_epsilon_start=args.planner_epsilon_start,
+        planner_epsilon_decay_steps=args.planner_epsilon_decay_steps,
         planner_prune=args.planner_prune,
         planner_prune_width=args.planner_prune_width,
         model_hidden_size=args.model_hidden_size,
