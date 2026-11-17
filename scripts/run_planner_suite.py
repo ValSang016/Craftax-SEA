@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Queue graph-planner runs over GPUs.
 
-Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore][-e<eps>]``:
+Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore|-half][-e<eps>]``:
 K hops, leaf term on/off, repeat-target reward x, optional static prune, and
-``nore`` = completed goals cannot be selected again, ``e<eps>`` = after
+``nore`` = completed goals cannot be selected again, ``half`` = only
+eat_cow/collect_drink/eat_plant can be selected again, ``e<eps>`` = after
 warmup a uniform random candidate goal with probability eps.  Jobs are queued seed by
 seed (every condition's seed 0, then seed 1, ...) and handed to the first free
 GPU slot.
@@ -44,12 +45,14 @@ def parse_condition(token):
             "leaf": leaf == "leaf",
             "repeat": float(repeat[1:]),
             "prune": "none",
-            "reselect": True,
+            "reselect": "true",
             "epsilon": 0.0,
         }
         for extra in extras:
             if extra == "nore":
-                condition["reselect"] = False
+                condition["reselect"] = "false"
+            elif extra == "half":
+                condition["reselect"] = "half"
             elif extra[:1] == "e" and extra[1:]:
                 condition["epsilon"] = float(extra[1:])
                 if not 0 <= condition["epsilon"] <= 1:
@@ -71,7 +74,7 @@ def condition_args(condition):
         "--planner-leaf", str(condition["leaf"]).lower(),
         "--repeat-target-coefficient", f"{condition['repeat']:g}",
         "--planner-prune", condition["prune"],
-        "--allow-completed-goals", str(condition["reselect"]).lower(),
+        "--reselection", condition["reselect"],
         "--planner-epsilon", f"{condition['epsilon']:g}",
     ]
 
@@ -79,7 +82,7 @@ def condition_args(condition):
 def build_jobs(args):
     jobs = []
     for seed in args.seeds:
-        for condition in args.conditions:
+        for index, condition in enumerate(args.conditions):
             output = Path(args.output).resolve() / condition["name"] / f"seed-{seed}"
             command = [
                 args.python, "-m", "craftax.sea_planner.train",
@@ -102,8 +105,11 @@ def build_jobs(args):
                 ]
                 if args.wandb_entity:
                     command += ["--wandb-entity", args.wandb_entity]
-            jobs.append({"name": f"{condition['name']}-s{seed}", "seed": seed,
-                         "output": str(output), "command": command})
+            job = {"name": f"{condition['name']}-s{seed}", "seed": seed,
+                   "output": str(output), "command": command}
+            if args.gpu_per_condition:
+                job["pinned_gpu"] = args.gpus[index % len(args.gpus)]
+            jobs.append(job)
     return jobs
 
 
@@ -123,6 +129,8 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--jobs-per-gpu", type=int, default=1)
+    parser.add_argument("--gpu-per-condition", action="store_true",
+                        help="pin each condition to one GPU (condition i -> gpus[i %% len])")
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--warmup-steps", type=int, default=50_000_000)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -189,8 +197,14 @@ def main():
     while (pending or running) and not stopping:
         free = [slot for slot in range(len(slots)) if slot not in running]
         while pending and free:
-            slot = free.pop(0)
-            job = pending.pop(0)
+            # First pending job that may run on a free slot's GPU.
+            match = next(((j, s) for j, job in enumerate(pending) for s in free
+                          if job.get("pinned_gpu", slots[s]) == slots[s]), None)
+            if match is None:
+                break
+            index, slot = match
+            free.remove(slot)
+            job = pending.pop(index)
             output = Path(job["output"])
             output.parent.mkdir(parents=True, exist_ok=True)
             log = (output.parent / f"seed-{job['seed']}.log").open("a", encoding="utf-8")

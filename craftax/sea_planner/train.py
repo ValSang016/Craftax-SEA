@@ -58,6 +58,17 @@ def parse_bool(value):
     raise argparse.ArgumentTypeError(f"expected true/false, got {value!r}")
 
 
+def parse_reselection(value):
+    lowered = str(value).lower()
+    if lowered in ("1", "true", "yes", "y"):
+        return "true"
+    if lowered in ("0", "false", "no", "n"):
+        return "false"
+    if lowered == "half":
+        return "half"
+    raise argparse.ArgumentTypeError(f"expected true/false/half, got {value!r}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -118,7 +129,10 @@ def build_parser():
     parser.add_argument("--high-level-batch-size", type=int, default=256)
     parser.add_argument("--high-level-min-replay-size", type=int, default=1024)
     parser.add_argument("--allow-unready-goals", type=parse_bool, default=True, metavar="BOOL")
-    parser.add_argument("--allow-completed-goals", type=parse_bool, default=True, metavar="BOOL")
+    parser.add_argument("--reselection", "--allow-completed-goals", dest="allow_completed_goals",
+                        type=parse_reselection, default="true", metavar="{false,true,half}",
+                        help="completed goals selectable again: none, all, or only "
+                             "eat_cow/collect_drink/eat_plant (half)")
     # W&B.
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY"))

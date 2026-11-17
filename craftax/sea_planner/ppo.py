@@ -39,6 +39,7 @@ from craftax.sea_planner.goals import (
     choose_meta_controller_goals,
     get_goal_candidates,
     high_level_option_done,
+    normalize_reselection,
     warmup_option_done,
     warmup_option_recorded,
 )
@@ -127,11 +128,17 @@ def make_train(
         num_objectives=num_goals,
     )
 
+    if normalize_reselection(planner_config.allow_completed_goals) != normalize_reselection(
+        runtime.allow_completed_goals
+    ):
+        raise ValueError("planner and goal runtime disagree on goal reselection")
+    reselectable = runtime.reselectable
+
     def planner_goals(key, observation, completed, node, needs_goal, model):
         candidates = get_goal_candidates(
             completed, graph,
             allow_unready_goals=planner_config.allow_unready_goals,
-            allow_completed_goals=planner_config.allow_completed_goals,
+            allow_completed_goals=reselectable,
         )
         # Split only when exploring so epsilon=0 keeps the original RNG stream.
         if planner_config.planner_epsilon > 0:

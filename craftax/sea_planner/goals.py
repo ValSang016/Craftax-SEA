@@ -14,6 +14,31 @@ import jax.numpy as jnp
 import numpy as np
 
 from craftax.sea.goal import GoalState, select_goals
+from craftax.sea.metrics import ACHIEVEMENT_NAMES
+
+# Which completed goals may be commanded again in the same episode:
+# "false" none, "true" all, "half" only the renewable survival goals.
+RESELECTION_MODES = ("false", "true", "half")
+HALF_RESELECTABLE_GOALS = ("eat_cow", "collect_drink", "eat_plant")
+
+
+def normalize_reselection(value):
+    """``True``/``False`` (old configs) or a mode name -> a mode name."""
+    if isinstance(value, (bool, np.bool_)):
+        return "true" if value else "false"
+    mode = str(value).lower()
+    if mode not in RESELECTION_MODES:
+        raise ValueError(f"reselection must be one of {RESELECTION_MODES}, got {value!r}")
+    return mode
+
+
+def reselectable_mask(reselection, achievement_ids):
+    """Boolean mask over goals that may be selected again once completed."""
+    mode = normalize_reselection(reselection)
+    if mode == "half":
+        names = [ACHIEVEMENT_NAMES[i] for i in achievement_ids]
+        return np.array([name in HALF_RESELECTABLE_GOALS for name in names])
+    return np.full(len(achievement_ids), mode == "true")
 
 
 @dataclass(frozen=True)
@@ -24,8 +49,9 @@ class PlannerGoalRuntime:
     non_target_achievement_coefficient: float = 1.0
     # Reward for achieving the commanded goal again in the same episode.
     repeat_target_coefficient: float = 0.0
-    # Completed goals can be commanded again; success then counts repeats.
-    allow_completed_goals: bool = True
+    # Completed goals that can be commanded again (true / false / "half");
+    # for those goals success then counts repeats.
+    allow_completed_goals: bool | str = True
     reset_rnn_on_goal: bool = True
 
     def __post_init__(self):
@@ -38,6 +64,11 @@ class PlannerGoalRuntime:
             raise ValueError("goal reward coefficients must be finite and non-negative")
         if len(self.achievement_ids) != int(self.graph.shape[0]):
             raise ValueError("achievement_ids must match the graph size")
+        normalize_reselection(self.allow_completed_goals)
+
+    @property
+    def reselectable(self):
+        return jnp.asarray(reselectable_mask(self.allow_completed_goals, self.achievement_ids))
 
     @property
     def num_goals(self):
@@ -73,9 +104,9 @@ def advance_goal_progress(
     (the outcome of the option that just ended).
     """
     ids = jnp.asarray(runtime.achievement_ids)
-    observed = achievement_events if runtime.allow_completed_goals else new_achievements
-    events = observed[:, ids]
     novel = new_achievements[:, ids]
+    # Repeats count as events (and as target success) only for reselectable goals.
+    events = jnp.where(runtime.reselectable, achievement_events[:, ids], novel)
     objective = goal_state.objective[:, None]
     goal_done = jnp.take_along_axis(events, objective, axis=1)[:, 0]
     target_is_new = jnp.take_along_axis(novel, objective, axis=1)[:, 0]
@@ -108,11 +139,14 @@ def advance_goal_progress(
 def get_goal_candidates(
     completed, graph, *, allow_unready_goals=False, allow_completed_goals=False
 ):
-    """Prerequisite and completion eligibility, with a non-empty fallback."""
+    """Prerequisite and completion eligibility, with a non-empty fallback.
+
+    ``allow_completed_goals`` is a bool or a per-goal reselectable mask.
+    """
     count = graph.shape[0]
     completed = completed[..., :count]
     prerequisites_met = jnp.all(~graph.astype(bool) | completed[..., :, None], axis=-2)
-    remaining = jnp.ones_like(completed) if allow_completed_goals else ~completed
+    remaining = ~completed | jnp.asarray(allow_completed_goals, dtype=bool)
     ready = (prerequisites_met | allow_unready_goals) & remaining
     has_ready = jnp.any(ready, axis=-1, keepdims=True)
     has_remaining = jnp.any(remaining, axis=-1, keepdims=True)
@@ -151,11 +185,15 @@ def choose_meta_controller_goals(key, completed, current_node, graph):
 
 
 __all__ = [
+    "HALF_RESELECTABLE_GOALS",
     "PlannerGoalRuntime",
+    "RESELECTION_MODES",
     "advance_goal_progress",
     "choose_meta_controller_goals",
     "get_goal_candidates",
     "high_level_option_done",
+    "normalize_reselection",
+    "reselectable_mask",
     "shape_goal_reward",
     "warmup_option_done",
     "warmup_option_recorded",

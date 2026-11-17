@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from craftax.sea.metrics import ACHIEVEMENT_NAMES
 from flax.training.train_state import TrainState
 
 from craftax.sea.goal import GoalState, load_oracle_graph
@@ -241,6 +242,27 @@ def test_rewards_first_target_three_nontarget_one_repeat_zero():
     assert not bool(_progress(_runtime(allow_completed_goals=False), 0, 22, [], [0], [0])[2][0])
 
 
+def test_half_reselection_only_for_cow_drink_plant():
+    from craftax.sea_planner.goals import reselectable_mask
+
+    _, ids = load_oracle_graph(GRAPH_PATH)
+    mask = reselectable_mask("half", ids)
+    names = [ACHIEVEMENT_NAMES[i] for i, m in zip(ids, mask) if m]
+    assert sorted(names) == ["collect_drink", "eat_cow", "eat_plant"]
+    assert reselectable_mask(True, ids).all() and not reselectable_mask("false", ids).any()
+    half = _runtime(allow_completed_goals="half")
+    cow, wood = ACHIEVEMENT_NAMES.index("eat_cow"), ACHIEVEMENT_NAMES.index("collect_wood")
+    # Repeating a reselectable goal is a target success; any other repeat is not.
+    assert bool(_progress(half, cow, 22, [], [cow], [cow])[2][0])
+    assert not bool(_progress(half, wood, 22, [], [wood], [wood])[2][0])
+    graph = jnp.zeros((22, 22), dtype=jnp.int8)
+    completed = _flags(cow, wood)
+    candidates = get_goal_candidates(completed, graph, allow_completed_goals=half.reselectable)
+    assert bool(candidates[0, cow]) and not bool(candidates[0, wood])
+    with pytest.raises(ValueError):
+        _runtime(allow_completed_goals="sometimes")
+
+
 def test_current_node_moves_on_first_time_or_target_only():
     runtime = _runtime()
     incidental = _progress(runtime, 5, 1, [], [0], completed=[0, 1])
@@ -309,18 +331,18 @@ def test_cli_flags_reach_configs():
     assert (planner.planner_temperature, planner.planner_prune, planner.planner_prune_width) == (0.2, "leaf", 7)
     assert (planner.model_hidden_size, planner.model_latent_size, planner.model_target_ema) == (128, 64, 0.99)
     assert (planner.learning_rate, planner.replay_ratio, planner.goal_timeout) == (1e-4, 2.0, 200)
-    assert not planner.allow_unready_goals and not planner.allow_completed_goals
+    assert not planner.allow_unready_goals and planner.allow_completed_goals == "false"
     assert planner.warmup_steps == 1000 and planner.planner_epsilon == 0.2
     assert make_env(vars(args)).health_reward_coef == 0.1
     default = build_parser().parse_args(["--output", "unused"])
     assert make_env(vars(default)).health_reward_coef == 0.3  # mortal default
     runtime = make_runtime(vars(args), GRAPH_PATH)
-    assert runtime.repeat_target_coefficient == 0.5 and not runtime.allow_completed_goals
+    assert runtime.repeat_target_coefficient == 0.5 and runtime.allow_completed_goals == "false"
     defaults = build_parser().parse_args(["--output", "unused"])
     env = make_env(vars(defaults))
     assert env.mortal and env.combat == "org" and env.idle_timeout == 10_000 and env.symbolic
     _, planner = make_configs(defaults)
-    assert planner.planner_horizon == 2 and planner.allow_completed_goals
+    assert planner.planner_horizon == 2 and planner.allow_completed_goals == "true"
     assert planner.warmup_steps == 50_000_000
 
 

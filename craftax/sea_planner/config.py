@@ -22,7 +22,9 @@ class PlannerConfig:
     goal_timeout: int = 300
     # Goal eligibility after warmup.
     allow_unready_goals: bool = True
-    allow_completed_goals: bool = True
+    # Reselection of completed goals: True, False or "half" (eat_cow,
+    # collect_drink and eat_plant only).
+    allow_completed_goals: bool | str = True
     # Planner.
     planner_horizon: int = 2
     planner_leaf: bool = True
@@ -51,6 +53,9 @@ class PlannerConfig:
             raise ValueError("option-model learning rate must be positive")
         if not np.isfinite(self.replay_ratio) or self.replay_ratio < 0:
             raise ValueError("replay ratio must be non-negative")
+        from craftax.sea_planner.goals import normalize_reselection
+
+        normalize_reselection(self.allow_completed_goals)
         if self.goal_timeout < 1:
             raise ValueError("goal timeout must be positive")
         if self.planner_horizon < 1 or self.planner_beam_width < 1:
