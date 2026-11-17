@@ -53,9 +53,9 @@ from craftax.environment_base.environment_bases import EnvironmentNoAutoReset
 COMBAT_MODES = ("sea", "org")
 IMMORTAL_IDLE_TIMEOUT = 100
 MORTAL_IDLE_TIMEOUT = 10_000
-# Crafter rewards 0.1 per health point next to +1 per achievement; the goal
-# reward here is +3 per target, so mortal runs use 0.3 to keep that ratio.
-MORTAL_HEALTH_REWARD_COEF = 0.3
+# Crafter's 0.1 per health point.  0.3 (Crafter's ratio to the +3 target
+# reward) made agents risk-averse: diamond fell from 14% to under 1%.
+MORTAL_HEALTH_REWARD_COEF = 0.1
 
 
 @struct.dataclass
@@ -309,7 +309,7 @@ def default_idle_timeout(mortal: bool) -> int:
 
 
 def default_health_reward_coef(mortal: bool) -> float:
-    """Health shaping used when none is given: 0.3 mortal, 0 immortal."""
+    """Health shaping used when none is given: 0.1 mortal, 0 immortal."""
     return MORTAL_HEALTH_REWARD_COEF if mortal else 0.0
 
 

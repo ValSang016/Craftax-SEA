@@ -54,7 +54,8 @@ def _planner_evaluator(run_dir, config, num_envs, updates, num_steps):
     from craftax.sea_planner.train import make_env, make_runtime
 
     args = config["args"]
-    planner = PlannerConfig(**config["planner"])
+    # Runs before the linear decoder used a 256-unit MLP decoder.
+    planner = PlannerConfig(**{"model_decoder_hidden_size": 256, **config["planner"]})
     # No warmup: the planner selects every goal.  The replay is never sampled.
     planner = replace(
         planner, warmup_steps=0, planner_epsilon=0.0, replay_capacity=planner.batch_size,

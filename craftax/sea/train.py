@@ -493,7 +493,7 @@ def build_parser():
         help="use vanilla Craftax health: the player can die (health <= 0 or lava ends the episode)",
     )
     parser.add_argument("--health-reward-coef", type=float, default=None,
-                        help="worker reward per health point gained/lost (default: 0.3 if mortal, else 0)")
+                        help="worker reward per health point gained/lost (default: 0.1 if mortal, else 0)")
     parser.add_argument(
         "--combat",
         choices=COMBAT_MODES,

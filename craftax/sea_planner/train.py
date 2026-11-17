@@ -84,7 +84,7 @@ def build_parser():
     parser.add_argument("--combat", choices=COMBAT_MODES, default="org",
                         help="org: vanilla cumulative damage and creature health")
     parser.add_argument("--health-reward-coef", type=float, default=None,
-                        help="worker reward per health point gained/lost (default: 0.3 if mortal, else 0)")
+                        help="worker reward per health point gained/lost (default: 0.1 if mortal, else 0)")
     # Worker PPO.
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--num-envs", type=int, default=1024)
@@ -120,6 +120,10 @@ def build_parser():
     parser.add_argument("--planner-prune-width", type=int, default=13)
     parser.add_argument("--model-hidden-size", type=int, default=256)
     parser.add_argument("--model-latent-size", type=int, default=128)
+    parser.add_argument("--completed-prediction", choices=("learned", "rule"), default="learned",
+                        help="c' after a hop: F's completed head or the rule c | onehot(goal)")
+    parser.add_argument("--model-decoder-hidden-size", type=int, default=0,
+                        help="aux decoder hidden layer; 0 = linear latent -> 16 (default)")
     parser.add_argument("--model-target-ema", type=float, default=0.995)
     parser.add_argument("--high-level-q-learning-rate", type=float, default=3e-4,
                         help="option-model (F) learning rate (name kept from the spec)")
@@ -183,6 +187,8 @@ def make_configs(args):
         planner_prune_width=args.planner_prune_width,
         model_hidden_size=args.model_hidden_size,
         model_latent_size=args.model_latent_size,
+        model_decoder_hidden_size=args.model_decoder_hidden_size,
+        completed_prediction=args.completed_prediction,
         model_target_ema=args.model_target_ema,
     )
     ppo.validate()
@@ -196,7 +202,7 @@ def make_env(args_dict):
         idle_timeout=args_dict["idle_timeout"],
         mortal=not args_dict["immortal"],
         combat=args_dict["combat"],
-        # Runs from before health shaping have no key: 0.3 if mortal.
+        # Runs from before health shaping have no key: the mortal default (0.1).
         health_reward_coef=args_dict.get("health_reward_coef"),
     )
 

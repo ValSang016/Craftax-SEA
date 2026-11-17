@@ -59,7 +59,6 @@ def _toy_state():
             return EdgePrediction(
                 success_logit=jnp.log(p) - jnp.log1p(-p),
                 log_duration=jnp.zeros_like(p),
-                death_logit=jnp.full_like(p, -10.0),
                 completed_logits=jnp.full(p.shape + (3,), -10.0),
                 next_latent=jnp.maximum(latent, jax.nn.one_hot(goal, latent.shape[-1])),
             )
@@ -138,6 +137,17 @@ def test_epsilon_explore_draws_uniform_candidates():
     assert bool((same == goals).all()) and not bool(none.any())
 
 
+def test_completed_rule_matches_learned_when_head_predicts_nothing():
+    # The toy completed head predicts nothing new, so the rule gives the same J.
+    learned = _scores(2, use_leaf=True)
+    rule = plan_path_scores(
+        _toy_state(), jnp.zeros((1, 4)), jnp.zeros((1, 3), dtype=bool), jnp.array([3]),
+        jnp.ones((1, 3), dtype=bool), horizon=2, beam_width=2, gamma=1.0, use_leaf=True,
+        max_duration=300.0, learn_completed=False,
+    )[0]
+    np.testing.assert_allclose(rule, learned, atol=1e-6)
+
+
 def test_leaf_prune_uses_prerequisites_only_for_the_leaf_term():
     graph = jnp.zeros((3, 3), dtype=jnp.int8).at[0, 1].set(1)  # 0 -> 1
     unpruned = _scores(1, use_leaf=True)
@@ -198,6 +208,11 @@ def test_supervised_updates_reduce_success_loss():
     )
     assert all(np.isfinite(float(v)) for v in metrics.values())
     assert float(after["success"]) < 0.5 * float(before["success"])
+    args = (state.train_state.params, state.target_params, state.train_state.apply_fn, batch)
+    learned, (losses, _, _) = option_model_loss(*args)
+    rule, _ = option_model_loss(*args, learn_completed=False)
+    np.testing.assert_allclose(float(learned - rule), float(losses["completed"]), rtol=1e-5)
+    assert "death" not in losses
 
 
 def test_replay_keeps_rows_and_update_count_uses_recorded_options():
@@ -324,6 +339,7 @@ def test_cli_flags_reach_configs():
         "--allow-completed-goals", "false", "--goal-success-coefficient", "3",
         "--non-target-achievement-coefficient", "1", "--repeat-target-coefficient", "0.5",
         "--dynamic-warmup-steps", "1000", "--health-reward-coef", "0.1",
+        "--completed-prediction", "rule", "--model-decoder-hidden-size", "64",
     ])
     _, planner = make_configs(args)
     assert (planner.planner_horizon, planner.planner_leaf, planner.planner_beam_width) == (3, False, 5)
@@ -333,9 +349,10 @@ def test_cli_flags_reach_configs():
     assert (planner.learning_rate, planner.replay_ratio, planner.goal_timeout) == (1e-4, 2.0, 200)
     assert not planner.allow_unready_goals and planner.allow_completed_goals == "false"
     assert planner.warmup_steps == 1000 and planner.planner_epsilon == 0.2
+    assert planner.completed_prediction == "rule" and planner.model_decoder_hidden_size == 64
     assert make_env(vars(args)).health_reward_coef == 0.1
     default = build_parser().parse_args(["--output", "unused"])
-    assert make_env(vars(default)).health_reward_coef == 0.3  # mortal default
+    assert make_env(vars(default)).health_reward_coef == 0.1  # mortal default
     runtime = make_runtime(vars(args), GRAPH_PATH)
     assert runtime.repeat_target_coefficient == 0.5 and runtime.allow_completed_goals == "false"
     defaults = build_parser().parse_args(["--output", "unused"])

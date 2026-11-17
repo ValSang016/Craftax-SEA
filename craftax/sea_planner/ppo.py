@@ -178,8 +178,12 @@ def make_train(
         )
         model = create_option_model(model_key, observation, num_goals, planner_config)
         if frozen:
+            # Rebuild the optimizer state from the checkpoint so older checkpoints
+            # (e.g. with the removed death head) keep a matching parameter tree.
+            ts = model.train_state
             model = model.replace(
-                train_state=model.train_state.replace(params=frozen_params["option_model"]),
+                train_state=ts.create(apply_fn=ts.apply_fn, params=frozen_params["option_model"],
+                                      tx=ts.tx),
                 target_params=frozen_params["option_model_target"],
             )
 
@@ -346,7 +350,8 @@ def make_train(
                 key, batch_key = jax.random.split(key)
                 batch = planner_state.replay.sample(batch_key, planner_config.batch_size)
                 model, metrics = update_option_model(
-                    model, batch, planner_config.model_target_ema
+                    model, batch, planner_config.model_target_ema,
+                    planner_config.completed_prediction == "learned",
                 )
                 sums = {name: sums[name] + metrics[name] for name in GRAPH_METRIC_NAMES}
                 return model, key, sums

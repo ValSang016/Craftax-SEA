@@ -5,8 +5,8 @@ achievements of the episode, current node) and a goal ``g_j``, F predicts
 
 * ``p``   edge probability p(g_j succeeds | x);
 * ``tau`` duration until success;
-* ``d``   probability of dying during the option (trained, not used in J);
-* ``c'``  completed vector after success;
+* ``c'``  completed vector after success (learned, or the rule
+  ``c | onehot(g_j)`` when ``learn_completed`` is off);
 * ``z'``  latent situation after success (input of the next hop);
 
 and decodes inventory + intrinsics from latents.  Every head is trained by
@@ -33,7 +33,6 @@ AUX_SIZE = AUX_STOP - AUX_START
 
 LOSS_WEIGHTS = {
     "success": 1.0,
-    "death": 1.0,
     "duration": 0.1,
     "completed": 1.0,
     "consistency": 1.0,
@@ -52,7 +51,6 @@ GRAPH_METRIC_NAMES = (
 class EdgePrediction(NamedTuple):
     success_logit: jax.Array
     log_duration: jax.Array
-    death_logit: jax.Array
     completed_logits: jax.Array
     next_latent: jax.Array
 
@@ -62,6 +60,8 @@ class OptionModel(nn.Module):
     hidden_size: int = 256
     latent_size: int = 128
     goal_embedding_size: int = 32
+    # 0: linear decoder latent -> 16 (default); > 0: one hidden ReLU layer.
+    decoder_hidden_size: int = 0
 
     def setup(self):
         self.enc_1 = nn.Dense(2 * self.hidden_size)
@@ -73,11 +73,11 @@ class OptionModel(nn.Module):
         self.trans_2 = nn.Dense(self.hidden_size)
         self.success = nn.Dense(1)
         self.duration = nn.Dense(1)
-        self.death = nn.Dense(1)
         self.completed = nn.Dense(self.num_goals)
         self.latent_delta = nn.Dense(self.latent_size)
         self.next_norm = nn.LayerNorm()
-        self.dec_1 = nn.Dense(self.hidden_size)
+        if self.decoder_hidden_size > 0:
+            self.dec_1 = nn.Dense(self.decoder_hidden_size)
         self.dec_2 = nn.Dense(AUX_SIZE)
 
     def encode(self, observation, completed, node):
@@ -101,13 +101,14 @@ class OptionModel(nn.Module):
         return EdgePrediction(
             success_logit=self.success(hidden)[..., 0],
             log_duration=self.duration(hidden)[..., 0],
-            death_logit=self.death(hidden)[..., 0],
             completed_logits=self.completed(hidden),
             next_latent=self.next_norm(latent + self.latent_delta(hidden)),
         )
 
     def decode(self, latent):
-        return self.dec_2(nn.relu(self.dec_1(latent)))
+        if self.decoder_hidden_size > 0:
+            latent = nn.relu(self.dec_1(latent))
+        return self.dec_2(latent)
 
     def __call__(self, observation, completed, node, goal):
         latent = self.encode(observation, completed, node)
@@ -125,6 +126,7 @@ def create_option_model(key, observation, num_goals, config):
         num_goals=num_goals,
         hidden_size=config.model_hidden_size,
         latent_size=config.model_latent_size,
+        decoder_hidden_size=config.model_decoder_hidden_size,
     )
     batch = observation.shape[0]
     params = model.init(
@@ -157,16 +159,18 @@ def _success_mean(values, success):
     return (values * success).sum() / jnp.maximum(success.sum(), 1.0)
 
 
-def option_model_loss(params, target_params, apply_fn, batch):
-    """Supervised loss; post-success heads use successful options only."""
+def option_model_loss(params, target_params, apply_fn, batch, learn_completed=True):
+    """Supervised loss; post-success heads use successful options only.
+
+    Without ``learn_completed`` the completed head is not trained (the
+    planner then uses the rule ``c' = c | onehot(goal)``).
+    """
     success = batch.success.astype(jnp.float32)
-    died = batch.died.astype(jnp.float32)
     latent = _encode(apply_fn, params, batch.observation, batch.completed, batch.current_node)
     prediction = _edge(apply_fn, params, latent, batch.goal)
     num_goals = prediction.completed_logits.shape[-1]
 
     success_loss = optax.sigmoid_binary_cross_entropy(prediction.success_logit, success).mean()
-    death_loss = optax.sigmoid_binary_cross_entropy(prediction.death_logit, died).mean()
     log_duration = jnp.log(jnp.maximum(batch.duration, 1).astype(jnp.float32))
     duration_loss = _success_mean(jnp.square(prediction.log_duration - log_duration), success)
     completed_loss = _success_mean(
@@ -193,21 +197,21 @@ def option_model_loss(params, target_params, apply_fn, batch):
     )
     losses = {
         "success": success_loss,
-        "death": death_loss,
         "duration": duration_loss,
         "completed": completed_loss,
         "consistency": consistency_loss,
         "aux": aux_loss,
     }
-    total = sum(LOSS_WEIGHTS[name] * value for name, value in losses.items())
+    weights = dict(LOSS_WEIGHTS, completed=LOSS_WEIGHTS["completed"] * float(learn_completed))
+    total = sum(weights[name] * value for name, value in losses.items())
     return total, (losses, jax.nn.sigmoid(prediction.success_logit), latent)
 
 
-def update_option_model(state: OptionModelState, batch, target_ema):
+def update_option_model(state: OptionModelState, batch, target_ema, learn_completed=True):
     train_state = state.train_state
     (total, (losses, probability, latent)), grads = jax.value_and_grad(
         option_model_loss, has_aux=True
-    )(train_state.params, state.target_params, train_state.apply_fn, batch)
+    )(train_state.params, state.target_params, train_state.apply_fn, batch, learn_completed)
     train_state = train_state.apply_gradients(grads=grads)
     target_params = optax.incremental_update(
         train_state.params, state.target_params, 1.0 - target_ema
@@ -246,7 +250,7 @@ def prerequisites_met(completed, graph):
     return jnp.all(~graph | completed[..., :, None], axis=-2)
 
 
-def _all_edges(apply_fn, params, latent, num_goals, max_duration):
+def _all_edges(apply_fn, params, latent, num_goals, max_duration, learn_completed=True):
     """Predictions for every goal from ``latent [..., L]`` -> ``[..., G]``."""
     batch_shape = latent.shape[:-1] + (num_goals,)
     prediction = _edge(
@@ -257,7 +261,10 @@ def _all_edges(apply_fn, params, latent, num_goals, max_duration):
     )
     probability = jax.nn.sigmoid(prediction.success_logit)
     duration = jnp.clip(jnp.exp(prediction.log_duration), 1.0, max_duration)
-    completed_after = jax.nn.sigmoid(prediction.completed_logits) > 0.5
+    if learn_completed:
+        completed_after = jax.nn.sigmoid(prediction.completed_logits) > 0.5
+    else:  # rule: only the goal itself becomes completed (added by the caller)
+        completed_after = jnp.zeros(batch_shape + (num_goals,), dtype=bool)
     return probability, duration, completed_after, prediction.next_latent
 
 
@@ -276,6 +283,7 @@ def plan_path_scores(
     graph=None,
     prune="none",
     prune_width=13,
+    learn_completed=True,
 ):
     """Best K-hop path score J for every first goal, shape ``[N, G]``.
 
@@ -300,7 +308,7 @@ def plan_path_scores(
     # Hop 1, axes [N, G1].
     latent = _encode(apply_fn, params, observation, completed, current_node)
     probability, duration, completed_after, next_latent = _all_edges(
-        apply_fn, params, latent, num_goals, max_duration
+        apply_fn, params, latent, num_goals, max_duration, learn_completed
     )
     path_probability = probability
     elapsed = duration
@@ -315,7 +323,7 @@ def plan_path_scores(
 
     for _ in range(horizon - 1):
         probability, duration, completed_after, next_latent = _all_edges(
-            apply_fn, params, latent, num_goals, max_duration
+            apply_fn, params, latent, num_goals, max_duration, learn_completed
         )  # [N, G1, B, G]
         step_probability = path_probability[..., None] * probability
         step_elapsed = elapsed[..., None] + duration
@@ -349,7 +357,7 @@ def plan_path_scores(
         new_candidates = ~path_completed & candidates[..., None, None, :]
         if prune == "none":
             probability, duration, _, _ = _all_edges(
-                apply_fn, params, latent, num_goals, max_duration
+                apply_fn, params, latent, num_goals, max_duration, learn_completed
             )
             leaf = (gamma**duration * probability * new_candidates).sum(-1)
         else:
@@ -420,6 +428,7 @@ def choose_planner_goals(
         graph=graph,
         prune=config.planner_prune,
         prune_width=config.planner_prune_width,
+        learn_completed=config.completed_prediction == "learned",
     )
     if config.planner_prune == "all":
         # Hop 1 is pruned through the candidates, if any ready goal exists.

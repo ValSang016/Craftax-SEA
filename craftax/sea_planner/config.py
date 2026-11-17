@@ -40,6 +40,12 @@ class PlannerConfig:
     # Option model F.
     model_hidden_size: int = 256
     model_latent_size: int = 128
+    # Aux decoder latent -> inventory+intrinsics: 0 = linear (default),
+    # 256 = the original MLP decoder (runs before 2026-11-17).
+    model_decoder_hidden_size: int = 0
+    # Completed vector after a hop: "learned" head of F, or the "rule"
+    # c' = c | onehot(goal) (no completed head training).
+    completed_prediction: str = "learned"
     model_target_ema: float = 0.995
 
     def validate(self):
@@ -72,6 +78,10 @@ class PlannerConfig:
             raise ValueError("planner prune must be none, leaf, or all")
         if self.planner_prune_width < 1:
             raise ValueError("planner prune width must be positive")
+        if self.completed_prediction not in ("learned", "rule"):
+            raise ValueError("completed prediction must be learned or rule")
+        if self.model_decoder_hidden_size < 0:
+            raise ValueError("decoder hidden size cannot be negative")
         if self.model_hidden_size < 1 or self.model_latent_size < 1:
             raise ValueError("model sizes must be positive")
         if not 0 <= self.model_target_ema < 1:

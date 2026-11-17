@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Queue graph-planner runs over GPUs.
 
-Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore|-half][-e<eps>]``:
+Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore|-half][-e<eps>][-crule]``:
 K hops, leaf term on/off, repeat-target reward x, optional static prune, and
 ``nore`` = completed goals cannot be selected again, ``half`` = only
 eat_cow/collect_drink/eat_plant can be selected again, ``e<eps>`` = after
-warmup a uniform random candidate goal with probability eps.  Jobs are queued seed by
+warmup a uniform random candidate goal with probability eps, ``crule`` = the
+completed vector after a hop is c | onehot(goal) instead of F's prediction.  Jobs are queued seed by
 seed (every condition's seed 0, then seed 1, ...) and handed to the first free
 GPU slot.
 
@@ -47,12 +48,15 @@ def parse_condition(token):
             "prune": "none",
             "reselect": "true",
             "epsilon": 0.0,
+            "completed": "learned",
         }
         for extra in extras:
             if extra == "nore":
                 condition["reselect"] = "false"
             elif extra == "half":
                 condition["reselect"] = "half"
+            elif extra == "crule":
+                condition["completed"] = "rule"
             elif extra[:1] == "e" and extra[1:]:
                 condition["epsilon"] = float(extra[1:])
                 if not 0 <= condition["epsilon"] <= 1:
@@ -76,6 +80,7 @@ def condition_args(condition):
         "--planner-prune", condition["prune"],
         "--reselection", condition["reselect"],
         "--planner-epsilon", f"{condition['epsilon']:g}",
+        "--completed-prediction", condition["completed"],
     ]
 
 

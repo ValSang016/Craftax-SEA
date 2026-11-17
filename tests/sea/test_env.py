@@ -160,8 +160,8 @@ def test_mortal_env_terminates_in_lava():
 
 def test_health_reward_coef_defaults_and_health_delta():
     assert make_sea_craftax_classic_env().health_reward_coef == 0.0
-    assert make_sea_craftax_classic_env(mortal=True).health_reward_coef == 0.3
-    assert make_sea_craftax_classic_env(mortal=True, health_reward_coef=0.1).health_reward_coef == 0.1
+    assert make_sea_craftax_classic_env(mortal=True).health_reward_coef == 0.1
+    assert make_sea_craftax_classic_env(mortal=True, health_reward_coef=0.3).health_reward_coef == 0.3
     with pytest.raises(ValueError):
         make_sea_craftax_classic_env(mortal=True, health_reward_coef=-1.0)
     env = make_sea_craftax_classic_env(mortal=True)
@@ -176,7 +176,7 @@ def test_health_reward_coef_defaults_and_health_delta():
     )
     delta = float(next_state.env_state.player_health) - 5.0
     assert delta < 0
-    assert float(info["health_reward"]) == pytest.approx(0.3 * delta)
+    assert float(info["health_reward"]) == pytest.approx(0.1 * delta)
     assert float(reward) == float(info["event_count"])  # env reward is unchanged
     immortal = make_sea_craftax_classic_env()
     _, state = immortal.reset(jax.random.PRNGKey(13), immortal.default_params)
