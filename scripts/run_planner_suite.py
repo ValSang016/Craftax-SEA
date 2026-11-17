@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Queue graph-planner runs over GPUs.
 
-Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore]``:
+Conditions are ``K<h>-<leaf|noleaf>-r<x>[-p<none|leaf|all>][-nore][-e<eps>]``:
 K hops, leaf term on/off, repeat-target reward x, optional static prune, and
-``nore`` = completed goals cannot be selected again.  Jobs are queued seed by
+``nore`` = completed goals cannot be selected again, ``e<eps>`` = after
+warmup a uniform random candidate goal with probability eps.  Jobs are queued seed by
 seed (every condition's seed 0, then seed 1, ...) and handed to the first free
 GPU slot.
 
@@ -44,10 +45,15 @@ def parse_condition(token):
             "repeat": float(repeat[1:]),
             "prune": "none",
             "reselect": True,
+            "epsilon": 0.0,
         }
         for extra in extras:
             if extra == "nore":
                 condition["reselect"] = False
+            elif extra[:1] == "e" and extra[1:]:
+                condition["epsilon"] = float(extra[1:])
+                if not 0 <= condition["epsilon"] <= 1:
+                    raise ValueError
             elif extra[:1] == "p" and extra[1:] in ("none", "leaf", "all"):
                 condition["prune"] = extra[1:]
             else:
@@ -55,7 +61,7 @@ def parse_condition(token):
         return condition
     except (ValueError, IndexError):
         raise argparse.ArgumentTypeError(
-            f"bad condition {token!r}; e.g. K2-leaf-r0, K2-leaf-r0-nore, K3-noleaf-r1-pleaf"
+            f"bad condition {token!r}; e.g. K2-leaf-r0, K2-leaf-r0-nore-e0.2, K3-noleaf-r1-pleaf"
         ) from None
 
 
@@ -66,6 +72,7 @@ def condition_args(condition):
         "--repeat-target-coefficient", f"{condition['repeat']:g}",
         "--planner-prune", condition["prune"],
         "--allow-completed-goals", str(condition["reselect"]).lower(),
+        "--planner-epsilon", f"{condition['epsilon']:g}",
     ]
 
 

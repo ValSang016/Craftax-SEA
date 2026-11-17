@@ -234,6 +234,7 @@ def make_train(
                         new_achievements=info["new_achievements"],
                         achievement_events=info["achievement_events"],
                     )
+                policy_reward = policy_reward + info["health_reward"]
                 goal_done = goal_done.astype(bool)
                 bootstrap_done = env_done | goal_done
                 next_reset = (

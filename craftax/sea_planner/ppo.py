@@ -46,6 +46,7 @@ from craftax.sea_planner.metrics import episode_metrics
 from craftax.sea_planner.option_model import (
     GRAPH_METRIC_NAMES,
     choose_planner_goals,
+    epsilon_explore,
     create_option_model,
     update_option_model,
 )
@@ -75,6 +76,7 @@ class OptionStep(NamedTuple):
     selected_goal: jax.Array
     selected_new: jax.Array
     overflow: jax.Array
+    explored: jax.Array
     warmup: jax.Array
 
 
@@ -131,10 +133,19 @@ def make_train(
             allow_unready_goals=planner_config.allow_unready_goals,
             allow_completed_goals=planner_config.allow_completed_goals,
         )
-        return choose_planner_goals(
-            key, model, observation, completed, node, candidates, needs_goal,
+        # Split only when exploring so epsilon=0 keeps the original RNG stream.
+        if planner_config.planner_epsilon > 0:
+            plan_key, explore_key = jax.random.split(key)
+        else:
+            plan_key, explore_key = key, key
+        goals, overflow = choose_planner_goals(
+            plan_key, model, observation, completed, node, candidates, needs_goal,
             planner_config, graph=graph,
         )
+        goals, explored = epsilon_explore(
+            explore_key, goals, candidates, planner_config.planner_epsilon
+        )
+        return goals, overflow, explored
 
     def train(key):
         key, init_key, reset_key, model_key, goal_key = jax.random.split(key, 5)
@@ -170,7 +181,7 @@ def make_train(
         if planner_config.warmup_steps > 0:
             objective = choose_meta_controller_goals(goal_key, completed, node, graph)
         else:
-            objective, _ = planner_goals(
+            objective, _, _ = planner_goals(
                 goal_key, observation, completed, node,
                 jnp.ones((config.num_envs,), dtype=bool), model,
             )
@@ -212,6 +223,7 @@ def make_train(
                 runtime, goal_state, env_done, info["event_count"],
                 info["new_achievements"], info["achievement_events"],
             )
+            reward = reward + info["health_reward"]
 
             duration = planner_state.duration + 1
             in_warmup = planner_state.env_steps < planner_config.warmup_steps
@@ -253,7 +265,7 @@ def make_train(
                     goals = choose_meta_controller_goals(
                         select_key, progress.completed, progress.last_completed, graph
                     )
-                    return goals, no_overflow
+                    return goals, no_overflow, no_overflow
 
                 def plan(_):
                     return planner_goals(
@@ -263,9 +275,9 @@ def make_train(
 
                 return jax.lax.cond(select_warmup, warmup, plan, operand=None)
 
-            selected, overflow = jax.lax.cond(
+            selected, overflow, explored = jax.lax.cond(
                 option_done.any(), select,
-                lambda _: (objective, no_overflow), operand=None,
+                lambda _: (objective, no_overflow, no_overflow), operand=None,
             )
             next_objective = jnp.where(option_done, selected, objective)
             selected_new = ~jnp.take_along_axis(
@@ -303,6 +315,7 @@ def make_train(
                 selected_goal=selected,
                 selected_new=selected_new,
                 overflow=overflow & option_done,
+                explored=explored & option_done,
                 warmup=jnp.broadcast_to(select_warmup, option_done.shape),
             )
             runner_state = (
@@ -459,6 +472,7 @@ def make_train(
                     (options.selected_new & ended).astype(jnp.float32).sum() / per_option
                 ),
                 "planner_overflow_fraction": options.overflow.astype(jnp.float32).sum() / per_option,
+                "planner_random_fraction": options.explored.astype(jnp.float32).sum() / per_option,
                 "warmup_selection_fraction": (
                     (options.warmup & ended).astype(jnp.float32).sum() / per_option
                 ),

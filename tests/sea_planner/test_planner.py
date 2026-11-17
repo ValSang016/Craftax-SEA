@@ -24,6 +24,7 @@ from craftax.sea_planner.option_model import (
     EdgePrediction,
     OptionModelState,
     choose_planner_goals,
+    epsilon_explore,
     create_option_model,
     option_model_loss,
     plan_path_scores,
@@ -120,6 +121,20 @@ def test_sampling_is_scale_free():
     assert abs(shares[0] - shares[1]) < 0.03
     # exp(10 * 0.2) ~ 7.4 : 1 between the two best goals.
     assert 0.8 < shares[0] < 0.92
+
+
+def test_epsilon_explore_draws_uniform_candidates():
+    goals = jnp.zeros((20000,), dtype=jnp.int32)
+    candidates = jnp.zeros((20000, 5), dtype=bool).at[:, 1:4].set(True)
+    candidates = candidates.at[-100:].set(False)  # no candidate: keep the goal
+    out, explored = epsilon_explore(jax.random.PRNGKey(0), goals, candidates, 0.2)
+    assert abs(float(explored[:-100].mean()) - 0.2) < 0.02
+    assert not bool(explored[-100:].any()) and bool((out[-100:] == 0).all())
+    assert bool((out[~explored] == 0).all())
+    picks = np.bincount(np.asarray(out[explored]), minlength=5) / int(explored.sum())
+    np.testing.assert_allclose(picks, [0, 1 / 3, 1 / 3, 1 / 3, 0], atol=0.03)
+    same, none = epsilon_explore(jax.random.PRNGKey(0), goals, candidates, 0.0)
+    assert bool((same == goals).all()) and not bool(none.any())
 
 
 def test_leaf_prune_uses_prerequisites_only_for_the_leaf_term():
@@ -279,14 +294,14 @@ def test_cli_flags_reach_configs():
         "--output", "unused", "--high-level-controller", "graph-planner",
         "--planner-horizon", "3", "--planner-leaf", "false", "--planner-beam-width", "5",
         "--planner-max-decisions", "64", "--planner-gamma", "0.95",
-        "--planner-temperature", "0.2", "--planner-prune", "leaf",
+        "--planner-temperature", "0.2", "--planner-epsilon", "0.2", "--planner-prune", "leaf",
         "--planner-prune-width", "7", "--model-hidden-size", "128",
         "--model-latent-size", "64", "--model-target-ema", "0.99",
         "--high-level-q-learning-rate", "1e-4", "--high-level-q-replay-ratio", "2",
         "--high-level-goal-timeout", "200", "--allow-unready-goals", "false",
         "--allow-completed-goals", "false", "--goal-success-coefficient", "3",
         "--non-target-achievement-coefficient", "1", "--repeat-target-coefficient", "0.5",
-        "--dynamic-warmup-steps", "1000",
+        "--dynamic-warmup-steps", "1000", "--health-reward-coef", "0.1",
     ])
     _, planner = make_configs(args)
     assert (planner.planner_horizon, planner.planner_leaf, planner.planner_beam_width) == (3, False, 5)
@@ -295,7 +310,10 @@ def test_cli_flags_reach_configs():
     assert (planner.model_hidden_size, planner.model_latent_size, planner.model_target_ema) == (128, 64, 0.99)
     assert (planner.learning_rate, planner.replay_ratio, planner.goal_timeout) == (1e-4, 2.0, 200)
     assert not planner.allow_unready_goals and not planner.allow_completed_goals
-    assert planner.warmup_steps == 1000
+    assert planner.warmup_steps == 1000 and planner.planner_epsilon == 0.2
+    assert make_env(vars(args)).health_reward_coef == 0.1
+    default = build_parser().parse_args(["--output", "unused"])
+    assert make_env(vars(default)).health_reward_coef == 0.3  # mortal default
     runtime = make_runtime(vars(args), GRAPH_PATH)
     assert runtime.repeat_target_coefficient == 0.5 and not runtime.allow_completed_goals
     defaults = build_parser().parse_args(["--output", "unused"])
@@ -337,6 +355,19 @@ def test_ppo_transition_uses_the_goal_followed_in_that_step():
     assert np.isfinite(np.asarray(result["metrics"]["loss"])).all()
 
 
+def test_planner_epsilon_mixes_random_goals_after_warmup():
+    make_train, config, env, runtime, planner = _tiny(goal_timeout=1, planner_epsilon=0.5)
+    result = jax.jit(make_train(config, env, runtime, planner, return_rollout=True))(
+        jax.random.PRNGKey(3)
+    )
+    _, options = result["rollout"]
+    explored = np.asarray(options.explored)
+    ended = np.asarray(options.option_done)
+    assert not (explored & ~ended).any()
+    assert 0.3 < explored[ended].mean() < 0.7
+    assert float(np.asarray(result["metrics"]["planner_random_fraction"]).mean()) > 0.3
+
+
 def test_warmup_uses_meta_controller_and_censors_options():
     make_train, config, env, runtime, planner = _tiny(warmup_steps=10**9)
     result = jax.jit(make_train(config, env, runtime, planner, return_rollout=True))(
@@ -348,6 +379,7 @@ def test_warmup_uses_meta_controller_and_censors_options():
     assert np.asarray(options.warmup).all()
     assert not (recorded & ~ended).any()
     assert float(np.asarray(result["metrics"]["planner_overflow_fraction"]).sum()) == 0.0
+    assert not np.asarray(options.explored).any()
 
 
 def test_frozen_mode_changes_no_weights():

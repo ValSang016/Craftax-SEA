@@ -383,6 +383,23 @@ def sample_from_scores(key, scores, candidates, temperature):
     return jax.random.categorical(key, logits).astype(jnp.int32)
 
 
+def epsilon_explore(key, goals, candidates, epsilon):
+    """With probability ``epsilon`` replace each goal by a uniform candidate.
+
+    Returns ``(goals, explored_mask)``.  Envs without any candidate keep
+    their goal.
+    """
+    if epsilon <= 0:
+        return goals, jnp.zeros(goals.shape, dtype=bool)
+    coin_key, goal_key = jax.random.split(key)
+    explored = jax.random.uniform(coin_key, goals.shape) < epsilon
+    explored = explored & candidates.any(-1)
+    uniform = jax.random.categorical(
+        goal_key, jnp.where(candidates, 0.0, -jnp.inf)
+    ).astype(goals.dtype)
+    return jnp.where(explored, uniform, goals), explored
+
+
 def choose_planner_goals(
     key, state, observation, completed, current_node, candidates, needs_goal, config,
     graph=None,
@@ -452,6 +469,7 @@ __all__ = [
     "OptionModel",
     "OptionModelState",
     "choose_planner_goals",
+    "epsilon_explore",
     "create_option_model",
     "option_model_loss",
     "plan_path_scores",

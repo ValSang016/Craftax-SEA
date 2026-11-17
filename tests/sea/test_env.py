@@ -158,6 +158,34 @@ def test_mortal_env_terminates_in_lava():
     assert env.is_terminal(state, params)
 
 
+def test_health_reward_coef_defaults_and_health_delta():
+    assert make_sea_craftax_classic_env().health_reward_coef == 0.0
+    assert make_sea_craftax_classic_env(mortal=True).health_reward_coef == 0.3
+    assert make_sea_craftax_classic_env(mortal=True, health_reward_coef=0.1).health_reward_coef == 0.1
+    with pytest.raises(ValueError):
+        make_sea_craftax_classic_env(mortal=True, health_reward_coef=-1.0)
+    env = make_sea_craftax_classic_env(mortal=True)
+    params = env.default_params
+    _, state = env.reset(jax.random.PRNGKey(13), params)
+    # Starving with the recover counter at its threshold loses one health point.
+    core = state.env_state.replace(player_health=5, player_food=0, player_drink=0,
+                                   player_energy=0, player_recover=-15.0)
+    state = state.replace(env_state=core)
+    _, next_state, reward, _, info = env.step(
+        jax.random.PRNGKey(14), state, Action.NOOP.value, params
+    )
+    delta = float(next_state.env_state.player_health) - 5.0
+    assert delta < 0
+    assert float(info["health_reward"]) == pytest.approx(0.3 * delta)
+    assert float(reward) == float(info["event_count"])  # env reward is unchanged
+    immortal = make_sea_craftax_classic_env()
+    _, state = immortal.reset(jax.random.PRNGKey(13), immortal.default_params)
+    _, _, _, _, info = immortal.step(
+        jax.random.PRNGKey(14), state, Action.NOOP.value, immortal.default_params
+    )
+    assert float(info["health_reward"]) == 0.0
+
+
 def test_mortal_default_idle_timeout_is_ten_thousand():
     assert make_sea_craftax_classic_env().idle_timeout == 100
     assert make_sea_craftax_classic_env(mortal=True).idle_timeout == 10_000

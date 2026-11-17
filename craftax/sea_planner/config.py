@@ -30,6 +30,9 @@ class PlannerConfig:
     planner_max_decisions: int = 128
     planner_gamma: float = 0.99
     planner_temperature: float = 0.1
+    # With this probability a newly chosen goal is replaced by a uniform draw
+    # from the candidate goals (exploration on top of the planner softmax).
+    planner_epsilon: float = 0.0
     planner_prune: str = "none"
     planner_prune_width: int = 13
     # Option model F.
@@ -58,6 +61,8 @@ class PlannerConfig:
             raise ValueError("planner gamma must be in (0, 1]")
         if not np.isfinite(self.planner_temperature) or self.planner_temperature <= 0:
             raise ValueError("planner temperature must be positive")
+        if not 0 <= self.planner_epsilon <= 1:
+            raise ValueError("planner epsilon must be in [0, 1]")
         if self.planner_prune not in ("none", "leaf", "all"):
             raise ValueError("planner prune must be none, leaf, or all")
         if self.planner_prune_width < 1:

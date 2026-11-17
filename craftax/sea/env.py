@@ -23,6 +23,7 @@ transition encoder must see the true terminal observation before a reset.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import jax
@@ -52,6 +53,9 @@ from craftax.environment_base.environment_bases import EnvironmentNoAutoReset
 COMBAT_MODES = ("sea", "org")
 IMMORTAL_IDLE_TIMEOUT = 100
 MORTAL_IDLE_TIMEOUT = 10_000
+# Crafter rewards 0.1 per health point next to +1 per achievement; the goal
+# reward here is +3 per target, so mortal runs use 0.3 to keep that ratio.
+MORTAL_HEALTH_REWARD_COEF = 0.3
 
 
 @struct.dataclass
@@ -135,6 +139,7 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         static_env_params=None,
         mortal: bool = False,
         combat: str = "sea",
+        health_reward_coef: Optional[float] = None,
     ):
         super().__init__()
         if combat not in COMBAT_MODES:
@@ -147,6 +152,12 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         if int(idle_timeout) < 1:
             raise ValueError("idle_timeout must be positive")
         self.idle_timeout = int(idle_timeout)
+        if health_reward_coef is None:
+            health_reward_coef = default_health_reward_coef(self.mortal)
+        health_reward_coef = float(health_reward_coef)
+        if not math.isfinite(health_reward_coef) or health_reward_coef < 0:
+            raise ValueError("health_reward_coef must be finite and non-negative")
+        self.health_reward_coef = health_reward_coef
         base_cls = (
             CraftaxClassicSymbolicEnvNoAutoReset
             if symbolic
@@ -211,9 +222,16 @@ class SeaCraftaxClassicEnvNoAutoReset(EnvironmentNoAutoReset):
         done = idle_done | time_done | death_done
         new_state = SeaEnvState(stepped_state, idle_steps)
 
+        health_delta = stepped_state.player_health.astype(jnp.float32) - (
+            old_state.player_health.astype(jnp.float32)
+        )
+
         info = compute_score(stepped_state, done)
         info.update(
             {
+                # Crafter-style health shaping, added to the worker reward by
+                # the trainers (the returned env reward stays the event count).
+                "health_reward": self.health_reward_coef * health_delta,
                 "discount": jnp.where(done, 0.0, 1.0),
                 "event_count": event_count,
                 "event_happened": event_happened,
@@ -290,22 +308,30 @@ def default_idle_timeout(mortal: bool) -> int:
     return MORTAL_IDLE_TIMEOUT if mortal else IMMORTAL_IDLE_TIMEOUT
 
 
+def default_health_reward_coef(mortal: bool) -> float:
+    """Health shaping used when none is given: 0.3 mortal, 0 immortal."""
+    return MORTAL_HEALTH_REWARD_COEF if mortal else 0.0
+
+
 def make_sea_craftax_classic_env(
     symbolic: bool = True,
     idle_timeout: Optional[int] = None,
     mortal: bool = False,
     combat: str = "sea",
+    health_reward_coef: Optional[float] = None,
 ) -> SeaCraftaxClassicEnvNoAutoReset:
     if idle_timeout is None:
         idle_timeout = default_idle_timeout(mortal)
     return SeaCraftaxClassicEnvNoAutoReset(
-        symbolic=symbolic, idle_timeout=idle_timeout, mortal=mortal, combat=combat
+        symbolic=symbolic, idle_timeout=idle_timeout, mortal=mortal, combat=combat,
+        health_reward_coef=health_reward_coef,
     )
 
 
 __all__ = [
     "COMBAT_MODES",
     "SeaCraftaxClassicEnvNoAutoReset",
+    "default_health_reward_coef",
     "default_idle_timeout",
     "SeaEnvState",
     "_restore_immortal_player",

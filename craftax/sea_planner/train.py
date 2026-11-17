@@ -22,7 +22,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from craftax.sea.checkpoint import save_params
-from craftax.sea.env import COMBAT_MODES, make_sea_craftax_classic_env
+from craftax.sea.env import (
+    COMBAT_MODES,
+    default_health_reward_coef,
+    make_sea_craftax_classic_env,
+)
 from craftax.sea.goal import load_oracle_graph
 from craftax.sea.metrics import ACHIEVEMENT_NAMES, summarize_training_metrics
 from craftax.sea.ppo_rnn import PPOConfig
@@ -68,6 +72,8 @@ def build_parser():
     parser.add_argument("--idle-timeout", type=int, default=10_000)
     parser.add_argument("--combat", choices=COMBAT_MODES, default="org",
                         help="org: vanilla cumulative damage and creature health")
+    parser.add_argument("--health-reward-coef", type=float, default=None,
+                        help="worker reward per health point gained/lost (default: 0.3 if mortal, else 0)")
     # Worker PPO.
     parser.add_argument("--goal-timesteps", type=int, default=300_000_000)
     parser.add_argument("--num-envs", type=int, default=1024)
@@ -97,6 +103,8 @@ def build_parser():
     parser.add_argument("--planner-max-decisions", type=int, default=128)
     parser.add_argument("--planner-gamma", type=float, default=0.99)
     parser.add_argument("--planner-temperature", type=float, default=0.1)
+    parser.add_argument("--planner-epsilon", type=float, default=0.0,
+                        help="after warmup, probability of a uniform random candidate goal")
     parser.add_argument("--planner-prune", choices=("none", "leaf", "all"), default="none")
     parser.add_argument("--planner-prune-width", type=int, default=13)
     parser.add_argument("--model-hidden-size", type=int, default=256)
@@ -156,6 +164,7 @@ def make_configs(args):
         planner_max_decisions=args.planner_max_decisions,
         planner_gamma=args.planner_gamma,
         planner_temperature=args.planner_temperature,
+        planner_epsilon=args.planner_epsilon,
         planner_prune=args.planner_prune,
         planner_prune_width=args.planner_prune_width,
         model_hidden_size=args.model_hidden_size,
@@ -173,6 +182,8 @@ def make_env(args_dict):
         idle_timeout=args_dict["idle_timeout"],
         mortal=not args_dict["immortal"],
         combat=args_dict["combat"],
+        # Runs from before health shaping have no key: 0.3 if mortal.
+        health_reward_coef=args_dict.get("health_reward_coef"),
     )
 
 
@@ -291,6 +302,8 @@ def run(args):
     output = Path(args.output)
     if (output / "config.json").exists():
         raise FileExistsError(f"run already exists: {output}")
+    if args.health_reward_coef is None:
+        args.health_reward_coef = default_health_reward_coef(not args.immortal)
     ppo_config, planner_config = make_configs(args)
     graph_path = Path(args.graph_path).expanduser().resolve()
     args_dict = vars(args) | {"graph_path": str(graph_path)}

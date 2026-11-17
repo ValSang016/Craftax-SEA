@@ -24,6 +24,7 @@ from craftax.sea.discovery import (
 )
 from craftax.sea.env import (
     COMBAT_MODES,
+    default_health_reward_coef,
     default_idle_timeout,
     make_sea_craftax_classic_env,
 )
@@ -198,6 +199,8 @@ def run_pipeline(args):
         raise ValueError("clustering requires a positive rollout budget and at least two transitions")
     if args.idle_timeout is None:
         args.idle_timeout = default_idle_timeout(args.mortal)
+    if args.health_reward_coef is None:
+        args.health_reward_coef = default_health_reward_coef(args.mortal)
     if args.oracle_graph:
         if args.base_only or args.stop_after_clustering or args.base_policy_checkpoint:
             raise ValueError("--oracle-graph trains only the goal policy; drop "
@@ -218,6 +221,7 @@ def run_pipeline(args):
         idle_timeout=args.idle_timeout,
         mortal=args.mortal,
         combat=args.combat,
+        health_reward_coef=args.health_reward_coef,
     )
     common_ppo = dict(
         num_envs=args.num_envs,
@@ -488,6 +492,8 @@ def build_parser():
         action="store_true",
         help="use vanilla Craftax health: the player can die (health <= 0 or lava ends the episode)",
     )
+    parser.add_argument("--health-reward-coef", type=float, default=None,
+                        help="worker reward per health point gained/lost (default: 0.3 if mortal, else 0)")
     parser.add_argument(
         "--combat",
         choices=COMBAT_MODES,
